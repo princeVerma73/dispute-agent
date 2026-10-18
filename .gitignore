@@ -1,0 +1,10 @@
+.env
+venv/
+node_modules/
+__pycache__/
+*.pyc
+
+# third-party / not ours: add your own copies locally, never commit
+data/
+payswift/
+ai-logs/

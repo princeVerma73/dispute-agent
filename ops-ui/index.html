@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DisputeAgent — Ops Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #3b82f6;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --purple: #8b5cf6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 24px;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .header h1 { font-size: 24px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+    .header .badge {
+      background: rgba(59, 130, 246, 0.2);
+      color: var(--primary);
+      font-size: 12px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      border: 1px solid rgba(59, 130, 246, 0.4);
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+    .stat-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+    }
+    .stat-title { font-size: 13px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
+    .stat-value { font-size: 28px; font-weight: 700; margin-top: 8px; }
+
+    .main-grid {
+      display: grid;
+      grid-template-columns: 3fr 2fr;
+      gap: 24px;
+    }
+    @media(max-width: 900px) { .main-grid { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+    }
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+    .panel-title { font-size: 16px; font-weight: 600; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th { text-align: left; padding: 10px 12px; color: var(--text-muted); border-bottom: 1px solid var(--border); }
+    td { padding: 12px; border-bottom: 1px solid rgba(51, 65, 85, 0.5); vertical-align: middle; }
+    tr:hover { background: rgba(255, 255, 255, 0.02); }
+
+    .tag {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .tag-approval { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .tag-escalation { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
+    
+    .btn {
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: all 0.2s;
+    }
+    .btn-approve { background: var(--success); color: white; margin-right: 6px; }
+    .btn-approve:hover { filter: brightness(1.1); }
+    .btn-reject { background: #334155; color: var(--text); }
+    .btn-reject:hover { background: var(--danger); }
+    .btn-refresh { background: var(--border); color: var(--text); padding: 8px 16px; border-radius: 8px; }
+
+    /* Trace timeline */
+    .trace-search { display: flex; gap: 8px; margin-bottom: 16px; }
+    .trace-search input {
+      flex: 1;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      color: white;
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    .timeline { max-height: 540px; overflow-y: auto; padding-right: 8px; }
+    .timeline-item {
+      position: relative;
+      padding-left: 24px;
+      margin-bottom: 16px;
+      border-left: 2px solid var(--border);
+    }
+    .timeline-dot {
+      position: absolute;
+      left: -6px;
+      top: 0;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--primary);
+    }
+    .timeline-meta { font-size: 12px; color: var(--text-muted); display: flex; justify-content: space-between; margin-bottom: 4px; }
+    .timeline-content {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 13px;
+      font-family: monospace;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div>
+      <h1>⚡ DisputeAgent <span class="badge">Ops Console</span></h1>
+      <p style="font-size: 13px; color: var(--text-muted); margin-top: 4px;">Real-time Ops Approval Queue & AI Agent Audit Trail</p>
+    </div>
+    <button class="btn btn-refresh" onclick="loadData()">↻ Refresh Data</button>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-title">Pending Approvals</div>
+      <div class="stat-value" id="count-approvals" style="color: var(--warning);">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-title">Pending Escalations</div>
+      <div class="stat-value" id="count-escalations" style="color: var(--danger);">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-title">Total Pending Value</div>
+      <div class="stat-value" id="total-amount" style="color: var(--success);">₹0</div>
+    </div>
+  </div>
+
+  <div class="main-grid">
+    <!-- Pending Ops Queue -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Waiting for Operations Review</div>
+      </div>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Rider</th>
+              <th>Type</th>
+              <th>Amount</th>
+              <th>Reason</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="pending-tbody">
+            <tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No items pending review</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Agent Trace Viewer -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Agent Execution Trace</div>
+      </div>
+      <div class="trace-search">
+        <input type="text" id="trace-rider-id" placeholder="Enter Rider ID (e.g. R003, R016)" value="R003">
+        <button class="btn btn-approve" onclick="loadTrace()">Inspect</button>
+      </div>
+      <div class="timeline" id="trace-timeline">
+        <p style="color: var(--text-muted); font-size: 13px;">Enter a Rider ID above and click Inspect to view the agent's multi-step ReAct trace.</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function loadData() {
+      try {
+        const res = await fetch('/ops/pending');
+        const data = await res.json();
+        
+        let approvals = 0;
+        let escalations = 0;
+        let totalVal = 0;
+
+        const tbody = document.getElementById('pending-tbody');
+        tbody.innerHTML = '';
+
+        if (!data || data.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No items pending review</td></tr>';
+        } else {
+          data.forEach(item => {
+            if (item.type === 'approval') {
+              approvals++;
+              if (item.amount) totalVal += item.amount;
+            } else {
+              escalations++;
+            }
+
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td><strong>${item.id}</strong></td>
+              <td><a href="javascript:void(0)" onclick="inspectRider('${item.rider_id}')" style="color: var(--primary); font-weight:600;">${item.rider_id}</a></td>
+              <td><span class="tag tag-${item.type}">${item.type.toUpperCase()}</span></td>
+              <td style="font-weight: 600;">${item.amount ? '₹' + item.amount : '—'}</td>
+              <td style="font-size: 12px; max-width: 200px;">${item.reason}</td>
+              <td>
+                <button class="btn btn-approve" onclick="resolveItem('${item.id}', 'approve')">Approve</button>
+                <button class="btn btn-reject" onclick="resolveItem('${item.id}', 'reject')">Reject</button>
+              </td>
+            `;
+            tbody.appendChild(tr);
+          });
+        }
+
+        document.getElementById('count-approvals').innerText = approvals;
+        document.getElementById('count-escalations').innerText = escalations;
+        document.getElementById('total-amount').innerText = '₹' + totalVal;
+      } catch (err) {
+        console.error('Error fetching ops pending:', err);
+      }
+    }
+
+    async function resolveItem(id, action) {
+      if (!confirm(`Are you sure you want to ${action.toUpperCase()} dispute ${id}?`)) return;
+      try {
+        const res = await fetch(`/ops/pending/${id}/${action}`, { method: 'POST' });
+        const result = await res.json();
+        alert(`Dispute ${id} marked as ${action.toUpperCase()}!`);
+        loadData();
+      } catch (err) {
+        alert('Action failed: ' + err);
+      }
+    }
+
+    function inspectRider(riderId) {
+      document.getElementById('trace-rider-id').value = riderId;
+      loadTrace();
+    }
+
+    async function loadTrace() {
+      const riderId = document.getElementById('trace-rider-id').value.trim();
+      if (!riderId) return;
+
+      const container = document.getElementById('trace-timeline');
+      container.innerHTML = '<p style="color: var(--text-muted); font-size: 13px;">Loading trace steps...</p>';
+
+      try {
+        const res = await fetch(`/trace/${riderId}`);
+        const steps = await res.json();
+
+        if (!steps || steps.length === 0) {
+          container.innerHTML = `<p style="color: var(--text-muted); font-size: 13px;">No trace events recorded yet for ${riderId}.</p>`;
+          return;
+        }
+
+        container.innerHTML = '';
+        steps.forEach(step => {
+          const item = document.createElement('div');
+          item.className = 'timeline-item';
+          
+          let badgeColor = 'var(--primary)';
+          if (step.type === 'tool_call') badgeColor = 'var(--purple)';
+          if (step.type === 'decision') badgeColor = 'var(--warning)';
+          if (step.type === 'reply') badgeColor = 'var(--success)';
+          if (step.type === 'error') badgeColor = 'var(--danger)';
+
+          item.innerHTML = `
+            <div class="timeline-dot" style="background: ${badgeColor}"></div>
+            <div class="timeline-meta">
+              <span style="font-weight: 600; color: ${badgeColor};">${step.type.toUpperCase()}: ${step.name}</span>
+              <span>${new Date(step.at).toLocaleTimeString()}</span>
+            </div>
+            <div class="timeline-content">${typeof step.output === 'object' ? JSON.stringify(step.output, null, 2) : (step.output || JSON.stringify(step.input, null, 2) || '—')}</div>
+          `;
+          container.appendChild(item);
+        });
+      } catch (err) {
+        container.innerHTML = `<p style="color: var(--danger); font-size: 13px;">Failed to load trace: ${err}</p>`;
+      }
+    }
+
+    // Initial load
+    loadData();
+  </script>
+</body>
+</html>

@@ -58,5 +58,18 @@ class TraceStep(Base):
     input = Column(Text, nullable=True)  # JSON-encoded input or null
     output = Column(Text, nullable=True)  # JSON-encoded output or string
 
+class Settlement(Base):
+    __tablename__ = "settlements"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String, unique=True, index=True, nullable=False)
+    rider_id = Column(String, index=True, nullable=False)
+    kind = Column(String, nullable=False)
+    amount = Column(Integer, nullable=False)
+    channel = Column(String, nullable=True)  # 'autopay' | 'ops'
+    status = Column(String, nullable=False)  # 'reserved' | 'paid' | 'queued' | 'rejected' | 'failed'
+    ref = Column(String, nullable=True)
+    paid_on = Column(String, nullable=True)  # IST day string (YYYY-MM-DD)
+    created_at = Column(String, nullable=False)
+
 def init_db():
     Base.metadata.create_all(bind=engine)

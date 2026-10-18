@@ -1,6 +1,5 @@
 import os
 import json
-import uuid
 import logging
 import urllib.request
 import urllib.error
@@ -70,35 +69,26 @@ def record_trace(rider_id: str, step_type: str, name: str, input_data=None, outp
     finally:
         db.close()
 
-session_auto_paid_riders = set()
-session_auto_paid_amounts = set()
-
-def record_session_payout(rider_id: str, amount: int):
-    """Tracks that this rider received an auto-payout of amount in the current session/day."""
-    session_auto_paid_riders.add(rider_id)
-    session_auto_paid_amounts.add((rider_id, int(round(amount))))
-
-def reset_session_payouts():
-    """Clears session auto-payout tracking (called during /reset)."""
-    session_auto_paid_riders.clear()
-    session_auto_paid_amounts.clear()
-
-def call_payswift_payout(rider_id: str, amount: int, reference: str, max_retries: int = 5) -> dict:
+def call_payswift_payout(
+    rider_id: str,
+    amount: int,
+    reference: str,
+    idempotency_key: str,
+    max_retries: int = 5
+) -> dict:
     """
-    Executes a real payout transaction via the PaySwift sandbox POST /v1/payouts endpoint.
-    Includes automatic retry for transient 5xx/429 errors and idempotency key support.
+    Executes a payout transaction via the PaySwift sandbox POST /v1/payouts endpoint.
+    Includes automatic retry for transient 5xx/429 errors and deterministic idempotency key support.
     """
     import time
     base_url = get_payswift_url()
     url = f"{base_url}/v1/payouts"
     payload = {
         "rider_id": rider_id,
-        "amount": int(round(amount)),
+        "amount": int(amount),
         "reference": reference
     }
     data = json.dumps(payload).encode("utf-8")
-    payout_nonce = uuid.uuid4().hex[:10]
-    idempotency_key = f"ps-{rider_id}-{amount}-{payout_nonce}"
     headers = {
         "Content-Type": "application/json",
         "Idempotency-Key": idempotency_key
@@ -111,7 +101,6 @@ def call_payswift_payout(rider_id: str, amount: int, reference: str, max_retries
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
                 logger.info(f"PaySwift payout successful for {rider_id}: {resp_data}")
-                record_session_payout(rider_id, amount)
                 return resp_data
         except urllib.error.HTTPError as e:
             last_err = e
@@ -144,11 +133,3 @@ def get_payswift_payouts(rider_id: str = None) -> list:
     except Exception as e:
         logger.warning(f"Could not fetch payouts from PaySwift: {e}")
         return []
-
-def has_payout_today(rider_id: str) -> bool:
-    """
-    Finance Rule Guard:
-    'Auto-pay is fine for small amounts: up to ₹200 per dispute, once per rider per day.'
-    Enforces once per rider per day by tracking payouts issued in the active session/day.
-    """
-    return rider_id in session_auto_paid_riders

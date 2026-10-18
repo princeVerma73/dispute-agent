@@ -257,6 +257,27 @@ class TestResolveDate:
         """today=2026-10-02 with '20' -> 2026-09-20."""
         assert resolve_date("20", "2026-10-02") == "2026-09-20"
 
+    def test_month_name_mismatch_returns_none_20_aug(self):
+        """'20 aug' with today=2026-09-22 -> None (august != september)."""
+        assert resolve_date("20 aug", "2026-09-22") is None
+
+    def test_month_name_match_returns_date_20_sep(self):
+        """'20 sep' with today=2026-09-22 -> 2026-09-20."""
+        assert resolve_date("20 sep", "2026-09-22") == "2026-09-20"
+
+    def test_impossible_day_in_month_returns_none_30_feb(self):
+        """'30 feb' with today=2026-10-02 -> None."""
+        assert resolve_date("30 feb", "2026-10-02") is None
+
+    def test_31_never_raises(self):
+        """'31' must never raise an exception even if impossible in rolled-back month."""
+        # September has 30 days, so 31 rolls back to Sep and should safely return None, not raise
+        res = resolve_date("31", "2026-10-02")
+        assert res is None
+        # In a month with 31 days or rolled back to August (31 days):
+        res2 = resolve_date("31", "2026-09-22")
+        assert res2 == "2026-08-31"
+
     def test_no_date_returns_none(self):
         assert resolve_date("main ek rider hoon", self.TODAY) is None
 

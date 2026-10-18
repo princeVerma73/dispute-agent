@@ -197,41 +197,73 @@ def resolve_date(text: str, today: str) -> Optional[str]:
     Returns:
         YYYY-MM-DD string, or None if no date could be resolved.
     """
-    lower = text.lower().strip()
-    today_d = date.fromisoformat(today)
+    try:
+        lower = text.lower().strip()
+        today_d = date.fromisoformat(today)
 
-    # 1. Explicit ISO date
-    m_iso = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
-    if m_iso:
-        return m_iso.group(1)
+        # Check if text mentions any month name (jan..dec, common spellings)
+        month_names = {
+            "jan": 1, "january": 1, "janurary": 1,
+            "feb": 2, "february": 2, "feburary": 2,
+            "mar": 3, "march": 3,
+            "apr": 4, "april": 4,
+            "may": 5,
+            "jun": 6, "june": 6,
+            "jul": 7, "july": 7,
+            "aug": 8, "august": 8,
+            "sep": 9, "sept": 9, "september": 9,
+            "oct": 10, "october": 10,
+            "nov": 11, "november": 11,
+            "dec": 12, "december": 12,
+        }
+        m_month = re.search(
+            r"\b(jan(?:uary|urary)?|feb(?:ruary|urary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
+            lower
+        )
+        expected_month = month_names.get(m_month.group(1).lower()) if m_month else None
 
-    # 2. 'aaj' / 'today'
-    if re.search(r"\baaj\b|\btoday\b", lower):
-        return today
+        candidate: Optional[str] = None
 
-    # 3. 'kal' / 'yesterday'
-    if re.search(r"\bkal\b|\byesterday\b", lower):
-        return (today_d - timedelta(days=1)).isoformat()
-
-    # 4. Bare day number (1-31): resolves to most recent such day on or before today
-    m_day = re.search(r"\b([1-9]|[12]\d|3[01])\b", lower)
-    if m_day:
-        day_num = int(m_day.group(1))
-        if day_num <= today_d.day:
-            try:
-                return today_d.replace(day=day_num).isoformat()
-            except ValueError:
-                return None
+        # 1. Explicit ISO date
+        m_iso = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+        if m_iso:
+            candidate = m_iso.group(1)
+        # 2. 'aaj' / 'today'
+        elif re.search(r"\baaj\b|\btoday\b", lower):
+            candidate = today
+        # 3. 'kal' / 'yesterday'
+        elif re.search(r"\bkal\b|\byesterday\b", lower):
+            candidate = (today_d - timedelta(days=1)).isoformat()
         else:
-            # Day number is in the future for current month -> roll back one month
-            prev_year = today_d.year if today_d.month > 1 else today_d.year - 1
-            prev_month = today_d.month - 1 if today_d.month > 1 else 12
-            try:
-                return date(prev_year, prev_month, day_num).isoformat()
-            except ValueError:
-                return None
+            # 4. Bare day number (1-31): resolves to most recent such day on or before today
+            m_day = re.search(r"\b([1-9]|[12]\d|3[01])\b", lower)
+            if m_day:
+                day_num = int(m_day.group(1))
+                if day_num <= today_d.day:
+                    try:
+                        candidate = today_d.replace(day=day_num).isoformat()
+                    except ValueError:
+                        candidate = None
+                else:
+                    # Day number is in the future for current month -> roll back one month
+                    prev_year = today_d.year if today_d.month > 1 else today_d.year - 1
+                    prev_month = today_d.month - 1 if today_d.month > 1 else 12
+                    try:
+                        candidate = date(prev_year, prev_month, day_num).isoformat()
+                    except ValueError:
+                        candidate = None
 
-    return None
+        if candidate is None:
+            return None
+
+        # Validate candidate month matches mentioned month (if any)
+        cand_d = date.fromisoformat(candidate)
+        if expected_month is not None and cand_d.month != expected_month:
+            return None
+
+        return candidate
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -255,22 +287,40 @@ class Finding:
         return f"Finding({self.key!r}, Rs{self.amount}, {self.kind!r})"
 
 
-def audit_trip(trip: object, ledger_lines: list) -> Optional[Finding]:
+class TripAuditSummary:
+    """Detailed summary of a trip audit including expected fare and paid amount."""
+    __slots__ = ("expected_fare", "paid_amount", "finding")
+
+    def __init__(self, expected_fare: int, paid_amount: int, finding: Optional[Finding]):
+        self.expected_fare = expected_fare
+        self.paid_amount = paid_amount
+        self.finding = finding
+
+    def __iter__(self):
+        return iter((self.expected_fare, self.paid_amount, self.finding))
+
+    def __repr__(self) -> str:
+        return f"TripAuditSummary(expected={self.expected_fare}, paid={self.paid_amount}, finding={self.finding!r})"
+
+
+def audit_trip(trip: object, ledger_lines: list, return_summary: bool = False) -> Any:
     """Check a single trip for discrepancies against ledger payout lines.
 
     Args:
         trip: any object with attributes:
             .trip_id          (str)
             .status           (str)  -- 'completed' | 'cancelled_by_rider' | ...
-            .distance_km      (float) -- raw value (normalisation applied here)
+            .distance_km_raw / .distance_km (float) -- raw value (normalisation applied here)
             .surge_multiplier (float)
         ledger_lines: all PayoutLine-like objects for this trip, each with:
             .trip_id  (str | None)
             .amount   (float)
             .category (str)
+        return_summary: if True, returns TripAuditSummary(expected_fare, paid_amount, finding).
+                        if False (default), returns finding or None.
 
     Returns:
-        A Finding if a discrepancy exists, None otherwise.
+        A Finding if a discrepancy exists, None otherwise (or TripAuditSummary if return_summary=True).
 
     Notes:
         - Overpayments are NOT findings (platform never claws back).
@@ -289,9 +339,10 @@ def audit_trip(trip: object, ledger_lines: list) -> Optional[Finding]:
                 getattr(ln, "amount", 0) < 0)
         ]
         extra_count = len(penalty_lines) - 1  # 1 legitimate, rest are extras
+        finding = None
         if extra_count > 0:
             amount_owed = extra_count * CANCELLATION_PENALTY
-            return Finding(
+            finding = Finding(
                 key=f"penalty:{trip_id}",
                 trip_id=trip_id,
                 kind="duplicate_penalty",
@@ -301,10 +352,14 @@ def audit_trip(trip: object, ledger_lines: list) -> Optional[Finding]:
                     f"lines found (expected 1). Extra Rs{amount_owed} deducted in error."
                 ),
             )
-        return None
+        if return_summary:
+            return TripAuditSummary(expected_fare=0, paid_amount=0, finding=finding)
+        return finding
 
     if trip.status != "completed":
         # Other non-completed statuses earn Rs0 -- no finding
+        if return_summary:
+            return TripAuditSummary(expected_fare=0, paid_amount=0, finding=None)
         return None
 
     # Normalise distance (handle metres-stored-as-km, raw unconverted value)
@@ -321,8 +376,9 @@ def audit_trip(trip: object, ledger_lines: list) -> Optional[Finding]:
     ]
     paid = round_half_up(sum(ln.amount for ln in trip_payments))
 
+    finding = None
     if paid == 0:
-        return Finding(
+        finding = Finding(
             key=f"trip:{trip_id}",
             trip_id=trip_id,
             kind="unpaid",
@@ -332,10 +388,9 @@ def audit_trip(trip: object, ledger_lines: list) -> Optional[Finding]:
                 f"zero payment found in ledger."
             ),
         )
-
-    if earned > paid:
+    elif earned > paid:
         diff = earned - paid
-        return Finding(
+        finding = Finding(
             key=f"trip:{trip_id}",
             trip_id=trip_id,
             kind="underpaid",
@@ -346,7 +401,10 @@ def audit_trip(trip: object, ledger_lines: list) -> Optional[Finding]:
             ),
         )
 
-    return None  # fully paid or overpaid -- no finding
+    if return_summary:
+        return TripAuditSummary(expected_fare=earned, paid_amount=paid, finding=finding)
+
+    return finding
 
 
 # ---------------------------------------------------------------------------

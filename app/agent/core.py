@@ -24,21 +24,29 @@ from app.db.models import ConversationMessage
 logger = logging.getLogger(__name__)
 
 # Fast, high-capacity models only
-primary_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-candidate_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
-model_order = [primary_model] + [m for m in candidate_models if m != primary_model]
+def _build_model(provider: str, name: str):
+    if provider == "groq" and os.environ.get("GROQ_API_KEY"):
+        return ChatGroq(api_key=os.environ["GROQ_API_KEY"], model_name=name, temperature=0, max_retries=1)
+    if provider == "gemini" and os.environ.get("GOOGLE_API_KEY"):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(model=name, google_api_key=os.environ["GOOGLE_API_KEY"], temperature=0, max_retries=1)
+    return None  # key missing, skip this model
 
-primary_llm = ChatGroq(
-    api_key=os.environ.get("GROQ_API_KEY"),
-    model_name=model_order[0],
-    temperature=0,
-    max_retries=1
-)
-fallback_llms = [
-    ChatGroq(api_key=os.environ.get("GROQ_API_KEY"), model_name=m, temperature=0, max_retries=1)
-    for m in model_order[1:]
-]
-llm = primary_llm.with_fallbacks(fallback_llms)
+DEFAULT_ORDER = "groq:openai/gpt-oss-120b,groq:openai/gpt-oss-20b,gemini:gemini-2.5-flash"
+LLM_ORDER = os.environ.get("LLM_ORDER", DEFAULT_ORDER)
+
+_models = []
+for item in LLM_ORDER.split(","):
+    provider, name = item.strip().split(":", 1)
+    m = _build_model(provider.lower(), name)
+    if m is not None:
+        _models.append(m)
+        logger.info(f"LLM chain: {provider}:{name}")
+
+if not _models:
+    raise RuntimeError("No LLM configured: set GROQ_API_KEY and/or GOOGLE_API_KEY")
+
+llm = _models[0].with_fallbacks(_models[1:]) if len(_models) > 1 else _models[0]
 
 # Full tool suite for the autonomous dispute agent
 tools = [

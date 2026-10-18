@@ -24,7 +24,13 @@ from langchain_core.outputs import ChatResult, ChatGeneration
 from app.db.session import SessionLocal
 from app.db.models import Rider, Trip, PayoutLine, OpsDispute, Settlement, ConversationMessage
 from app.agent.core import process_dispute_message
+from app.agent.tools import RequestContext, build_tools
+from app.agent.settlement import create_escalation, new_dispute_id
 from app.main import receive_message, MessageRequest
+
+
+def _get_tool(tools, name):
+    return next(t for t in tools if t.name == name)
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -304,3 +310,195 @@ def test_concurrent_message_deduplication(monkeypatch, payswift_server):
 
     # Agent was invoked exactly once!
     assert execution_count == 1
+
+
+# ===========================================================================
+# Test g: Escalations unique IDs, deduplication, concurrency, and retry
+# ===========================================================================
+def test_escalations_unique_ids_and_deduplication():
+    db = SessionLocal()
+    _seed_rider(db, "R001")
+
+    # 1. Back-to-back distinct escalations get distinct IDs
+    esc1 = create_escalation(db, "R001", reason="Distinct reason 1")
+    esc2 = create_escalation(db, "R001", reason="Distinct reason 2")
+    assert esc1.dispute_id != esc2.dispute_id
+    assert esc1.dispute_id.startswith("op-")
+    assert esc2.dispute_id.startswith("op-")
+    assert len(esc1.dispute_id) == 11
+
+    # 2. Identical open escalation is not duplicated
+    esc1_dup = create_escalation(db, "R001", reason="Distinct reason 1")
+    assert esc1_dup.dispute_id == esc1.dispute_id
+
+    # Verify rows in DB: exactly 2 distinct rows
+    rows = db.query(OpsDispute).filter(OpsDispute.rider_id == "R001").all()
+    assert len(rows) == 2
+    db.close()
+
+
+def test_four_concurrent_escalations_all_get_distinct_ids():
+    db = SessionLocal()
+    _seed_rider(db, "R001")
+    db.close()
+
+    created_ids = []
+    lock = threading.Lock()
+
+    def worker(i):
+        w_db = SessionLocal()
+        try:
+            esc = create_escalation(w_db, "R001", reason=f"Concurrent escalation {i}")
+            with lock:
+                created_ids.append(esc.dispute_id)
+        finally:
+            w_db.close()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(created_ids) == 4
+    assert len(set(created_ids)) == 4  # all 4 distinct!
+
+    db = SessionLocal()
+    rows = db.query(OpsDispute).filter(OpsDispute.rider_id == "R001").all()
+    assert len(rows) == 4
+    for r in rows:
+        assert r.dispute_id.startswith("op-")
+    db.close()
+
+
+def test_escalation_retry_on_transient_failure(monkeypatch):
+    db = SessionLocal()
+    _seed_rider(db, "R001")
+
+    real_commit = db.commit
+    fail_once = True
+
+    def flaky_commit():
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise Exception("Transient DB commit error")
+        return real_commit()
+
+    monkeypatch.setattr(db, "commit", flaky_commit)
+    esc = create_escalation(db, "R001", reason="Flaky commit reason")
+    assert esc is not None
+    assert esc.dispute_id.startswith("op-")
+    db.close()
+
+
+# ===========================================================================
+# Test h: Forced OpsDispute insert failure in settle() marks Settlement rows
+#         as 'failed', and settle_owed can be called again and succeeds.
+# ===========================================================================
+def test_ops_dispute_insert_failure_marks_settlement_failed_and_retryable(monkeypatch, payswift_server):
+    db = SessionLocal()
+    _seed_rider(db, "R001")
+    # T001: 5 km at 1.0x surge = 43 owed
+    # T002: 5 km at 1.0x surge = 43 owed
+    _seed_trip(db, "T001", "R001", date="2026-09-21", distance_raw=5.0)
+    _seed_trip(db, "T002", "R001", date="2026-09-21", distance_raw=5.0)
+    db.close()
+
+    ctx = RequestContext("R001", "2026-09-22T10:00:00Z")
+    tools = build_tools(ctx)
+    settle_tool = _get_tool(tools, "settle_owed")
+
+    # 1. First settle T001: auto-paid via PaySwift (<=200)
+    res1 = settle_tool.invoke({"trip_ids": "T001"})
+    assert "PAID" in res1
+    assert len(payswift_server.payouts) == 1
+
+    # 2. Settle T002: second payment on the same day -> triggers Ops approval path.
+    # Force OpsDispute creation to fail once.
+    from sqlalchemy.orm import Session
+    real_add = Session.add
+
+    fail_ops_dispute = True
+
+    def flaky_add(self, instance, *args, **kwargs):
+        if isinstance(instance, OpsDispute) and instance.type == "approval" and fail_ops_dispute:
+            raise RuntimeError("Forced OpsDispute approval insert error")
+        return real_add(self, instance, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "add", flaky_add)
+
+    res_fail = settle_tool.invoke({"trip_ids": "T002"})
+    assert "FAILED" in res_fail
+
+    # Assert Settlement row for T002 ended as 'failed' (never left reserved!)
+    db = SessionLocal()
+    s_row = db.query(Settlement).filter(Settlement.key == "trip:T002").first()
+    assert s_row is not None
+    assert s_row.status == "failed"
+    db.close()
+
+    # 3. Disable the simulated failure and retry settle_owed for T002:
+    fail_ops_dispute = False
+    res_retry = settle_tool.invoke({"trip_ids": "T002"})
+    assert "QUEUED" in res_retry
+
+    # Assert Settlement row is now 'queued'
+    db = SessionLocal()
+    s_row_after = db.query(Settlement).filter(Settlement.key == "trip:T002").first()
+    assert s_row_after is not None
+    assert s_row_after.status == "queued"
+    db.close()
+
+
+# ===========================================================================
+# Test i: A FAILED result's text contains no exception message
+# ===========================================================================
+def test_failed_result_text_contains_no_exception_message(monkeypatch, payswift_server):
+    import time
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    db = SessionLocal()
+    _seed_rider(db, "R001")
+    _seed_trip(db, "T001", "R001", date="2026-09-21", distance_raw=5.0)
+    db.close()
+
+    # 1. PaySwift failure path
+    payswift_server.inject_failures(10)
+    ctx = RequestContext("R001", "2026-09-22T10:00:00Z")
+    tools = build_tools(ctx)
+    settle_tool = _get_tool(tools, "settle_owed")
+
+    res = settle_tool.invoke({"trip_ids": "T001"})
+    assert res == "FAILED. The payment could not be completed; the case was sent to the ops team."
+    assert "503" not in res
+    assert "HTTP" not in res
+    assert "Exception" not in res
+    assert "Traceback" not in res
+
+    # 2. OpsDispute insert failure path
+    payswift_server.reset()
+    # First settle T001 to use up the daily autopay
+    res_paid = settle_tool.invoke({"trip_ids": "T001"})
+    assert "PAID" in res_paid
+
+    # Seed T002 for second payment (triggers Ops approval)
+    db = SessionLocal()
+    _seed_trip(db, "T002", "R001", date="2026-09-21", distance_raw=5.0)
+    db.close()
+
+    from sqlalchemy.orm import Session
+    real_add = Session.add
+
+    def failing_add(self, instance, *args, **kwargs):
+        if isinstance(instance, OpsDispute) and instance.type == "approval":
+            raise RuntimeError("SecretInternalDatabaseException: disk full or unique key violation")
+        return real_add(self, instance, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "add", failing_add)
+
+    res_fail = settle_tool.invoke({"trip_ids": "T002"})
+    assert res_fail == "FAILED. The payment could not be completed; the case was sent to the ops team."
+    assert "SecretInternalDatabaseException" not in res_fail
+    assert "disk full" not in res_fail
+    assert "RuntimeError" not in res_fail

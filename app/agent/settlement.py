@@ -14,18 +14,70 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from uuid import uuid4
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from app.db.session import SessionLocal
 from app.db.models import Settlement, OpsDispute
-from app.agent.services import call_payswift_payout
+from app.agent.services import call_payswift_payout, record_trace
 from app.agent.calculator import Finding
 
 logger = logging.getLogger(__name__)
+
+
+def new_dispute_id() -> str:
+    """Generate a unique dispute ID formatted as 'op-' + 8 hex chars."""
+    return "op-" + uuid4().hex[:8]
+
+
+def create_escalation(db, rider_id: str, reason: str, trip_id: Optional[str] = None) -> OpsDispute:
+    """Inserts an OpsDispute (type 'escalation') and does not duplicate an identical open escalation.
+
+    If creating an escalation fails, logs the error and retries once with a fresh id before giving up.
+    """
+    clean_trip_id = trip_id.strip().upper() if trip_id else None
+
+    trip_filter = OpsDispute.trip_id.is_(None) if clean_trip_id is None else (OpsDispute.trip_id == clean_trip_id)
+    existing = db.query(OpsDispute).filter(
+        OpsDispute.rider_id == rider_id,
+        trip_filter,
+        OpsDispute.reason == reason,
+        OpsDispute.type == "escalation",
+        OpsDispute.status == "PENDING"
+    ).first()
+    if existing:
+        return existing
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    last_err = None
+    for attempt in range(2):
+        op_id = new_dispute_id()
+        dispute = OpsDispute(
+            dispute_id=op_id,
+            rider_id=rider_id,
+            trip_id=clean_trip_id,
+            type="escalation",
+            amount=None,
+            reason=reason,
+            status="PENDING",
+            created_at=now_iso,
+        )
+        try:
+            db.add(dispute)
+            db.commit()
+            return dispute
+        except Exception as e:
+            db.rollback()
+            last_err = e
+            logger.error(f"Attempt {attempt + 1} to create escalation failed for {rider_id}: {e}", exc_info=True)
+            if attempt == 0:
+                continue
+
+    raise RuntimeError(f"Failed to create escalation for {rider_id} after 2 attempts: {last_err}")
 
 
 def compute_idempotency_key(keys: List[str]) -> str:
@@ -185,36 +237,31 @@ def execute_settlement(
             except Exception as e:
                 # Rule 5: PaySwift failed -> mark items 'failed', create ops escalation, allow retry
                 logger.error(f"PaySwift payout failed for rider {rider_id}: {e}", exc_info=True)
+                record_trace(rider_id, "error", "payswift_payout_failed", {"keys": keys_summary, "amount": total_amount}, str(e))
                 for f in unique_findings:
                     s_row = db.query(Settlement).filter(Settlement.key == f.key).first()
                     if s_row:
                         s_row.status = "failed"
                         s_row.channel = "autopay"
-
-                count = db.query(OpsDispute).count() + 1
-                op_id = f"op-{count:03d}"
-                esc = OpsDispute(
-                    dispute_id=op_id,
-                    rider_id=rider_id,
-                    type="escalation",
-                    amount=None,
-                    reason=f"PaySwift payout failed for {keys_summary}: {str(e)}",
-                    status="PENDING",
-                    created_at=now_iso,
-                )
-                db.add(esc)
                 db.commit()
+
+                esc = create_escalation(
+                    db,
+                    rider_id=rider_id,
+                    reason=f"PaySwift payout failed for {keys_summary}: {str(e)}",
+                    trip_id=None
+                )
+                op_id = esc.dispute_id
 
                 return {
                     "result": "FAILED",
                     "amount": total_amount,
                     "ref": op_id,
-                    "message": f"Result: FAILED. PaySwift payout failed ({str(e)}). Escalated to Ops with ID {op_id}. Items can be retried."
+                    "message": "FAILED. The payment could not be completed; the case was sent to the ops team."
                 }
         else:
             # Rule 4: Queue for Ops approval
-            count = db.query(OpsDispute).count() + 1
-            op_id = f"op-{count:03d}"
+            op_id = new_dispute_id()
             keys_summary = ", ".join(sorted(f.key for f in unique_findings))
 
             reason = (
@@ -223,31 +270,64 @@ def execute_settlement(
                 else f"Second auto-pay on {today_ist} for rider {rider_id}; requires Ops approval ({keys_summary})"
             )
 
-            dispute = OpsDispute(
-                dispute_id=op_id,
-                rider_id=rider_id,
-                type="approval",
-                amount=float(total_amount),
-                reason=reason,
-                status="PENDING",
-                created_at=now_iso,
-            )
-            db.add(dispute)
+            try:
+                dispute = OpsDispute(
+                    dispute_id=op_id,
+                    rider_id=rider_id,
+                    type="approval",
+                    amount=float(total_amount),
+                    reason=reason,
+                    status="PENDING",
+                    created_at=now_iso,
+                )
+                db.add(dispute)
 
-            for f in unique_findings:
-                s_row = db.query(Settlement).filter(Settlement.key == f.key).first()
-                if s_row:
-                    s_row.status = "queued"
-                    s_row.channel = "ops"
-                    s_row.ref = op_id
+                for f in unique_findings:
+                    s_row = db.query(Settlement).filter(Settlement.key == f.key).first()
+                    if s_row:
+                        s_row.status = "queued"
+                        s_row.channel = "ops"
+                        s_row.ref = op_id
 
-            db.commit()
+                db.commit()
 
-            return {
-                "result": "QUEUED",
-                "amount": total_amount,
-                "ref": op_id,
-                "message": f"Result: QUEUED. Amount ₹{total_amount} queued for Ops approval (Dispute ID: {op_id}). Reason: {reason}."
-            }
+                return {
+                    "result": "QUEUED",
+                    "amount": total_amount,
+                    "ref": op_id,
+                    "message": f"Result: QUEUED. Amount ₹{total_amount} queued for Ops approval (Dispute ID: {op_id}). Reason: {reason}."
+                }
+            except Exception as e:
+                db.rollback()
+                logger.error(f"Failed to queue Ops approval dispute for {rider_id}: {e}", exc_info=True)
+                record_trace(rider_id, "error", "ops_approval_queue_failed", {"keys": keys_summary, "amount": total_amount}, str(e))
+                for f in unique_findings:
+                    s_row = db.query(Settlement).filter(Settlement.key == f.key).first()
+                    if s_row:
+                        s_row.status = "failed"
+                        s_row.channel = "ops"
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+
+                esc_id = None
+                try:
+                    esc = create_escalation(
+                        db,
+                        rider_id=rider_id,
+                        reason=f"Ops approval queue creation failed for {keys_summary}: {str(e)}",
+                        trip_id=None
+                    )
+                    esc_id = esc.dispute_id
+                except Exception as esc_err:
+                    logger.error(f"Failed to create fallback escalation: {esc_err}")
+
+                return {
+                    "result": "FAILED",
+                    "amount": total_amount,
+                    "ref": esc_id,
+                    "message": "FAILED. The payment could not be completed; the case was sent to the ops team."
+                }
     finally:
         db.close()

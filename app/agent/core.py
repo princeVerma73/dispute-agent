@@ -18,6 +18,7 @@ from app.agent.prompts import build_system_prompt
 from app.agent.tools import RequestContext, build_tools
 from app.agent.calculator import normalize_rider_id, DISPUTE_WINDOW_DAYS
 from app.agent.services import record_trace
+from app.agent.settlement import create_escalation
 from app.db.session import SessionLocal
 from app.db.models import Rider, ConversationMessage, OpsDispute
 
@@ -148,21 +149,12 @@ def process_dispute_message(
         fallback_rider_id = clean_rider_id or str(rider_id)
         db = SessionLocal()
         try:
-            count = db.query(OpsDispute).count() + 1
-            op_id = f"op-{count:03d}"
-            now_iso = datetime.now(timezone.utc).isoformat()
-            escalation = OpsDispute(
-                dispute_id=op_id,
+            create_escalation(
+                db,
                 rider_id=fallback_rider_id,
-                trip_id=None,
-                type="escalation",
-                amount=None,
                 reason=f"Invalid or unknown rider ID: {rider_id}",
-                status="PENDING",
-                created_at=now_iso,
+                trip_id=None
             )
-            db.add(escalation)
-            db.commit()
         except Exception as e:
             logger.error(f"Error logging ops escalation for bad rider {rider_id}: {e}")
         finally:
@@ -215,21 +207,12 @@ def process_dispute_message(
     # 8. Agent failed twice: create ops escalation and return polite fallback
     db = SessionLocal()
     try:
-        count = db.query(OpsDispute).count() + 1
-        op_id = f"op-{count:03d}"
-        now_iso = datetime.now(timezone.utc).isoformat()
-        escalation = OpsDispute(
-            dispute_id=op_id,
+        create_escalation(
+            db,
             rider_id=clean_rider_id,
-            trip_id=None,
-            type="escalation",
-            amount=None,
             reason=f"Agent failed after 2 attempts: {str(last_err)}",
-            status="PENDING",
-            created_at=now_iso,
+            trip_id=None
         )
-        db.add(escalation)
-        db.commit()
     except Exception as e:
         logger.error(f"Error logging failed agent ops escalation: {e}")
     finally:

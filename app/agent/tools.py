@@ -37,7 +37,7 @@ from app.agent.calculator import (
     audit_day as calc_audit_day,
     Finding,
 )
-from app.agent.settlement import execute_settlement
+from app.agent.settlement import execute_settlement, create_escalation
 
 logger = logging.getLogger(__name__)
 
@@ -313,8 +313,8 @@ def build_tools(ctx: RequestContext) -> List[Any]:
             return res_str
         except Exception as e:
             logger.error(f"Error in settle_owed for rider {rider_id}: {e}", exc_info=True)
-            res = f"Result: FAILED. Error executing settlement: {str(e)}"
-            record_trace(rider_id, "error", "settle_owed", {"day": day, "trip_ids": trip_ids}, res)
+            res = "FAILED. The payment could not be completed; the case was sent to the ops team."
+            record_trace(rider_id, "error", "settle_owed", {"day": day, "trip_ids": trip_ids}, str(e))
             return res
         finally:
             db.close()
@@ -337,37 +337,22 @@ def build_tools(ctx: RequestContext) -> List[Any]:
                     clean_trip_id = None
 
             # Rule 9: Do not duplicate open escalations for the same rider, trip, reason
+            trip_filter = OpsDispute.trip_id.is_(None) if clean_trip_id is None else (OpsDispute.trip_id == clean_trip_id)
             existing = db.query(OpsDispute).filter(
                 OpsDispute.rider_id == rider_id,
-                OpsDispute.trip_id == clean_trip_id,
+                trip_filter,
                 OpsDispute.reason == reason,
                 OpsDispute.type == "escalation",
                 OpsDispute.status == "PENDING"
             ).first()
 
+            dispute = create_escalation(db, rider_id=rider_id, reason=reason, trip_id=clean_trip_id)
+
             if existing:
-                res = f"An open escalation already exists with ID {existing.dispute_id} for this issue. No duplicate created."
-                record_trace(rider_id, "tool_call", "escalate_to_ops", {"reason": reason, "trip_id": clean_trip_id}, res)
-                return res
+                res = f"An open escalation already exists with ID {dispute.dispute_id} for this issue. No duplicate created."
+            else:
+                res = f"Issue escalated to Ops team for manual investigation (ID: {dispute.dispute_id})."
 
-            count = db.query(OpsDispute).count() + 1
-            op_id = f"op-{count:03d}"
-            now_iso = datetime.now(timezone.utc).isoformat()
-
-            dispute = OpsDispute(
-                dispute_id=op_id,
-                rider_id=rider_id,
-                trip_id=clean_trip_id,
-                type="escalation",
-                amount=None,
-                reason=reason,
-                status="PENDING",
-                created_at=now_iso,
-            )
-            db.add(dispute)
-            db.commit()
-
-            res = f"Issue escalated to Ops team for manual investigation (ID: {op_id})."
             record_trace(rider_id, "tool_call", "escalate_to_ops", {"reason": reason, "trip_id": clean_trip_id}, res)
             return res
         except Exception as e:

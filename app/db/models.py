@@ -13,9 +13,9 @@ class Trip(Base):
     trip_id = Column(String, primary_key=True)
     rider_id = Column(String)
     date = Column(String)
-    distance_km = Column(Float)
-    fare = Column(Float)
+    distance_km_raw = Column(Float)
     status = Column(String)
+    surge_multiplier = Column(Float, default=1.0)
 
 class PayoutLine(Base):
     __tablename__ = "payout_lines"

@@ -654,3 +654,25 @@ def test_reset_isolation_and_idempotency_salt(payswift_server, monkeypatch):
     assert len(payswift_server.payouts) == 1
     # Reset in-memory salt back to empty string for subsequent tests
     set_idempotency_salt("")
+
+
+# ===========================================================================
+# Test n: settle_owed's result text contains trip id and amount for single-trip settlement
+# ===========================================================================
+def test_settle_owed_result_contains_trip_id_and_amount(payswift_server):
+    db = SessionLocal()
+    _seed_rider(db, "R001")
+    # Trip T926334: 6.2 km on 2026-09-20 -> expected 50, paid 25 -> underpaid by 25
+    _seed_trip(db, "T926334", "R001", date="2026-09-20", distance_raw=6.2)
+    _seed_line(db, "L926", "R001", "T926334", 25.0)
+    db.close()
+
+    ctx = RequestContext("R001", "2026-09-22T10:00:00Z")
+    tools = build_tools(ctx)
+    settle_tool = _get_tool(tools, "settle_owed")
+
+    res = settle_tool.invoke({"trip_ids": "T926334"})
+    assert "T926334" in res
+    assert "25" in res
+    assert "2026-09-20: PAID Rs 25 (trip T926334 underpaid)" in res
+

@@ -126,6 +126,25 @@ def _get_finding_day(f: Finding, db: Any, default_day: str) -> str:
     return default_day
 
 
+def format_finding_item(f: Finding) -> str:
+    """Format a Finding into a human-readable item descriptor.
+
+    Examples:
+        - trip T926334 underpaid
+        - trip T123456 unpaid
+        - duplicate penalty on trip T123456
+        - daily incentive
+    """
+    if f.kind == "incentive":
+        return "daily incentive"
+    tid = f.trip_id or (f.key.split(":", 1)[1] if ":" in f.key and not f.key.startswith("incentive:") else "")
+    if f.kind == "duplicate_penalty":
+        return f"duplicate penalty on trip {tid}"
+    elif f.kind in ("underpaid", "unpaid"):
+        return f"trip {tid} {f.kind}"
+    return f"trip {tid} {f.kind}" if tid else f.kind
+
+
 def settle(
     rider_id: str,
     findings: List[Finding],
@@ -249,6 +268,8 @@ def settle(
                 day_results.append({"day": day, "result": "ALREADY_HANDLED", "amount": 0, "ref": None})
                 continue
 
+            items_summary = ", ".join(format_finding_item(f) for f in actionable_findings)
+
             # Rule 4: Autopay decision: day total <= 200 AND no autopay settlement with paid_on == today (IST)
             has_autopay_today = db.query(Settlement).filter(
                 Settlement.rider_id == rider_id,
@@ -282,7 +303,7 @@ def settle(
                             s_row.paid_on = today_ist
                     db.commit()
 
-                    day_messages.append(f"{day}: PAID Rs {day_total} (₹{day_total})")
+                    day_messages.append(f"{day}: PAID Rs {day_total} ({items_summary})")
                     day_results.append({"day": day, "result": "PAID", "amount": day_total, "ref": payout_id})
                 except Exception as e:
                     logger.error(f"PaySwift payout failed for rider {rider_id} on {day}: {e}", exc_info=True)
@@ -335,7 +356,7 @@ def settle(
 
                     db.commit()
 
-                    day_messages.append(f"{day}: QUEUED Rs {day_total} (₹{day_total})")
+                    day_messages.append(f"{day}: QUEUED Rs {day_total} ({items_summary})")
                     day_results.append({"day": day, "result": "QUEUED", "amount": day_total, "ref": op_id})
                 except Exception as e:
                     db.rollback()

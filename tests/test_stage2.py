@@ -77,7 +77,7 @@ def test_exact_autopay_amount_equals_finding(payswift_server):
 
     res = settle_tool.invoke({"trip_ids": "T001"})
     assert "PAID" in res
-    assert "₹18" in res
+    assert "Rs 18" in res
 
     # Verify PaySwift received exactly ₹18
     assert len(payswift_server.payouts) == 1
@@ -111,7 +111,7 @@ def test_greater_than_200_goes_to_ops_not_payswift(payswift_server):
 
     res = settle_tool.invoke({"trip_ids": "T002"})
     assert "QUEUED" in res
-    assert "₹313" in res
+    assert "Rs 313" in res
 
     # PaySwift must NOT have received any payout
     assert len(payswift_server.payouts) == 0

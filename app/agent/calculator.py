@@ -274,15 +274,16 @@ def resolve_date(text: str, today: str) -> Optional[str]:
 class Finding:
     """Represents a single discrepancy finding."""
 
-    __slots__ = ("key", "trip_id", "kind", "amount", "description")
+    __slots__ = ("key", "trip_id", "kind", "amount", "description", "date")
 
     def __init__(self, key: str, trip_id: Optional[str], kind: str,
-                 amount: int, description: str):
+                 amount: int, description: str, date: Optional[str] = None):
         self.key = key            # stable, e.g. 'trip:T123', 'penalty:T123'
         self.trip_id = trip_id
         self.kind = kind          # 'underpaid' | 'unpaid' | 'duplicate_penalty' | 'incentive'
         self.amount = amount      # rupees owed to the rider
         self.description = description
+        self.date = date
 
     def __repr__(self) -> str:
         return f"Finding({self.key!r}, Rs{self.amount}, {self.kind!r})"
@@ -347,6 +348,7 @@ def audit_trip(trip: object, ledger_lines: list) -> TripAudit:
             if (getattr(ln, "category", "") == "cancellation_penalty" or
                 getattr(ln, "amount", 0) < 0)
         ]
+        trip_date = getattr(trip, "date", None)
         extra_count = len(penalty_lines) - 1  # 1 legitimate, rest are extras
         finding = None
         if extra_count > 0:
@@ -360,6 +362,7 @@ def audit_trip(trip: object, ledger_lines: list) -> TripAudit:
                     f"Trip {trip_id}: {len(penalty_lines)} cancellation penalty "
                     f"lines found (expected 1). Extra Rs{amount_owed} deducted in error."
                 ),
+                date=trip_date,
             )
         return TripAudit(expected=0, paid=0, finding=finding)
 
@@ -381,6 +384,7 @@ def audit_trip(trip: object, ledger_lines: list) -> TripAudit:
     ]
     paid = round_half_up(sum(ln.amount for ln in trip_payments))
 
+    trip_date = getattr(trip, "date", None)
     finding = None
     if paid == 0:
         finding = Finding(
@@ -392,6 +396,7 @@ def audit_trip(trip: object, ledger_lines: list) -> TripAudit:
                 f"Trip {trip_id}: completed, expected Rs{earned}, "
                 f"zero payment found in ledger."
             ),
+            date=trip_date,
         )
     elif earned > paid:
         diff = earned - paid
@@ -404,6 +409,7 @@ def audit_trip(trip: object, ledger_lines: list) -> TripAudit:
                 f"Trip {trip_id}: expected Rs{earned}, paid Rs{paid}, "
                 f"underpaid by Rs{diff}."
             ),
+            date=trip_date,
         )
 
     return TripAudit(expected=earned, paid=paid, finding=finding)
@@ -502,6 +508,7 @@ def audit_day(ist_date: str, today: str, trips: list, ledger: list) -> DayAudit:
                 f"{ist_date}: {completed_count} completed trips (>= {INCENTIVE_TRIP_MIN}), "
                 f"daily incentive of Rs{INCENTIVE_AMOUNT} not yet paid."
             ),
+            date=ist_date,
         )
 
     return DayAudit(

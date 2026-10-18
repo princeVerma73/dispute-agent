@@ -470,7 +470,8 @@ def test_failed_result_text_contains_no_exception_message(monkeypatch, payswift_
     settle_tool = _get_tool(tools, "settle_owed")
 
     res = settle_tool.invoke({"trip_ids": "T001"})
-    assert res == "FAILED. The payment could not be completed; the case was sent to the ops team."
+    assert "FAILED" in res
+    assert "The payment could not be completed; the case was sent to the ops team." in res
     assert "503" not in res
     assert "HTTP" not in res
     assert "Exception" not in res
@@ -498,7 +499,158 @@ def test_failed_result_text_contains_no_exception_message(monkeypatch, payswift_
     monkeypatch.setattr(Session, "add", failing_add)
 
     res_fail = settle_tool.invoke({"trip_ids": "T002"})
-    assert res_fail == "FAILED. The payment could not be completed; the case was sent to the ops team."
+    assert "FAILED" in res_fail
+    assert "The payment could not be completed; the case was sent to the ops team." in res_fail
     assert "SecretInternalDatabaseException" not in res_fail
     assert "disk full" not in res_fail
     assert "RuntimeError" not in res_fail
+
+
+# ===========================================================================
+# Test j: Multi-day findings in one settle_owed call:
+#         Day 1 (15) PAID, Day 2 (10) QUEUED
+# ===========================================================================
+def test_multiday_findings_first_paid_second_queued(payswift_server):
+    db = SessionLocal()
+    _seed_rider(db, "R001")
+    # Day 1: 2026-09-20 -> completed 2.0 km (fare 25), paid 10 -> owed 15
+    _seed_trip(db, "T101", "R001", date="2026-09-20", distance_raw=2.0)
+    _seed_line(db, "L101", "R001", "T101", 10.0)
+
+    # Day 2: 2026-09-21 -> completed 2.0 km (fare 25), paid 15 -> owed 10
+    _seed_trip(db, "T102", "R001", date="2026-09-21", distance_raw=2.0)
+    _seed_line(db, "L102", "R001", "T102", 15.0)
+    db.close()
+
+    ctx = RequestContext("R001", "2026-09-22T10:00:00Z")
+    tools = build_tools(ctx)
+    settle_tool = _get_tool(tools, "settle_owed")
+
+    res = settle_tool.invoke({"trip_ids": "T101 T102"})
+    assert "2026-09-20: PAID Rs 15" in res
+    assert "2026-09-21: QUEUED Rs 10" in res
+
+    # Exactly 1 payout made to PaySwift for Day 1
+    assert len(payswift_server.payouts) == 1
+    assert payswift_server.payouts[0]["amount"] == 15
+
+    # Exactly 1 OpsDispute created for Day 2
+    db = SessionLocal()
+    ops = db.query(OpsDispute).filter(OpsDispute.rider_id == "R001", OpsDispute.type == "approval").first()
+    assert ops is not None
+    assert int(round(ops.amount)) == 10
+    db.close()
+
+
+# ===========================================================================
+# Test k: Two trips on one day totalling 176 -> exactly one payout of 176
+# ===========================================================================
+def test_two_trips_same_day_totalling_176_one_payout(payswift_server):
+    db = SessionLocal()
+    _seed_rider(db, "R001")
+    # T201: 12 km -> (25 + 10*6) = 85 owed
+    # T202: 13 km -> (25 + 11*6) = 91 owed
+    # 85 + 91 = 176
+    _seed_trip(db, "T201", "R001", date="2026-09-20", distance_raw=12.0)
+    _seed_trip(db, "T202", "R001", date="2026-09-20", distance_raw=13.0)
+    db.close()
+
+    ctx = RequestContext("R001", "2026-09-22T10:00:00Z")
+    tools = build_tools(ctx)
+    settle_tool = _get_tool(tools, "settle_owed")
+
+    res = settle_tool.invoke({"trip_ids": "T201 T202"})
+    assert "2026-09-20: PAID Rs 176" in res
+
+    # Exactly 1 payout of 176
+    assert len(payswift_server.payouts) == 1
+    assert payswift_server.payouts[0]["amount"] == 176
+
+
+# ===========================================================================
+# Test l: One day over 200 and another under 200 in one call
+#         Over-200 day is QUEUED, under-200 day is PAID
+# ===========================================================================
+def test_one_day_over_200_and_another_under_200_in_one_call(payswift_server):
+    db = SessionLocal()
+    _seed_rider(db, "R001")
+    # Day 1 (2026-09-19): 50 km -> (25 + 48*6) = 313 owed (> 200) -> QUEUED
+    _seed_trip(db, "T301", "R001", date="2026-09-19", distance_raw=50.0)
+    # Day 2 (2026-09-20): 5 km -> (25 + 3*6) = 43 owed (<= 200) -> PAID
+    _seed_trip(db, "T302", "R001", date="2026-09-20", distance_raw=5.0)
+    db.close()
+
+    ctx = RequestContext("R001", "2026-09-22T10:00:00Z")
+    tools = build_tools(ctx)
+    settle_tool = _get_tool(tools, "settle_owed")
+
+    res = settle_tool.invoke({"trip_ids": "T301 T302"})
+    assert "2026-09-19: QUEUED Rs 313" in res
+    assert "2026-09-20: PAID Rs 43" in res
+
+    # Exactly 1 payout of 43
+    assert len(payswift_server.payouts) == 1
+    assert payswift_server.payouts[0]["amount"] == 43
+
+    # Exactly 1 OpsDispute of 313
+    db = SessionLocal()
+    ops = db.query(OpsDispute).filter(OpsDispute.rider_id == "R001", OpsDispute.type == "approval").first()
+    assert ops is not None
+    assert int(round(ops.amount)) == 313
+    db.close()
+
+
+# ===========================================================================
+# Test m: Dev reset isolation & idempotency salt
+#         a. Finding settled before and after reset produces different keys
+#         b. Finding settled twice with no reset produces same key (1 payout)
+#         c. Calling /reset twice gives two different salts
+# ===========================================================================
+def test_reset_isolation_and_idempotency_salt(payswift_server, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.agent.settlement import compute_idempotency_key, set_idempotency_salt, get_idempotency_salt
+
+    client = TestClient(app)
+
+    # Ensure /reset is enabled
+    monkeypatch.setenv("ALLOW_RESET", "1")
+
+    # c. Calling /reset twice gives two different salts
+    res1 = client.post("/reset")
+    assert res1.status_code == 200
+    salt1 = res1.json()["salt"]
+    assert salt1
+
+    res2 = client.post("/reset")
+    assert res2.status_code == 200
+    salt2 = res2.json()["salt"]
+    assert salt2
+    assert salt1 != salt2
+
+    # a. The same finding settled before and after a reset produces two different keys
+    key_before = compute_idempotency_key(["trip:T001"])
+    client.post("/reset")
+    key_after = compute_idempotency_key(["trip:T001"])
+    assert key_before != key_after
+
+    # b. The same finding settled twice with no reset produces the same key and PaySwift is called once
+    db = SessionLocal()
+    _seed_rider(db, "R001")
+    _seed_trip(db, "T001", "R001", date="2026-09-21", distance_raw=5.0)
+    db.close()
+
+    ctx = RequestContext("R001", "2026-09-22T10:00:00Z")
+    tools = build_tools(ctx)
+    settle_tool = _get_tool(tools, "settle_owed")
+
+    res_first = settle_tool.invoke({"trip_ids": "T001"})
+    assert "PAID" in res_first
+    assert len(payswift_server.payouts) == 1
+
+    # Second call without reset
+    res_second = settle_tool.invoke({"trip_ids": "T001"})
+    assert "ALREADY_HANDLED" in res_second or "already being handled" in res_second
+    assert len(payswift_server.payouts) == 1
+    # Reset in-memory salt back to empty string for subsequent tests
+    set_idempotency_salt("")

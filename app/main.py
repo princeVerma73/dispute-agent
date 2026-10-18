@@ -29,6 +29,7 @@ from app.db.models import (
     Settlement,
 )
 from app.db.seed import seed_database
+from app.agent.settlement import set_idempotency_salt
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +253,8 @@ def reset_runtime_state():
     if os.environ.get("ALLOW_RESET") != "1":
         raise HTTPException(status_code=403, detail="Reset is disabled in this environment.")
 
+    new_salt = set_idempotency_salt()
+
     db = SessionLocal()
     try:
         db.query(ConversationMessage).delete()
@@ -259,6 +262,10 @@ def reset_runtime_state():
         db.query(OpsDispute).delete()
         db.query(Settlement).delete()
         db.commit()
-        return {"status": "reset", "message": "Runtime state and settlements cleared successfully."}
+        return {
+            "status": "reset",
+            "salt": new_salt,
+            "message": "Runtime state and settlements cleared successfully."
+        }
     finally:
         db.close()

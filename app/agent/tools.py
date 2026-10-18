@@ -37,7 +37,7 @@ from app.agent.calculator import (
     audit_day as calc_audit_day,
     Finding,
 )
-from app.agent.settlement import execute_settlement, create_escalation
+from app.agent.settlement import settle, execute_settlement, create_escalation
 
 logger = logging.getLogger(__name__)
 
@@ -307,7 +307,7 @@ def build_tools(ctx: RequestContext) -> List[Any]:
                 return res
 
             # Execute settlement via settlement engine (Rules 3, 4, 5)
-            settle_res = execute_settlement(rider_id, unique_findings, today_ist)
+            settle_res = settle(rider_id, unique_findings, today_ist)
             res_str = settle_res["message"]
             record_trace(rider_id, "tool_call", "settle_owed", {"day": day, "trip_ids": trip_ids}, res_str)
             return res_str

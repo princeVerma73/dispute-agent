@@ -103,9 +103,9 @@ def build_tools(ctx: RequestContext) -> List[Any]:
             surge = float(trip.surge_multiplier or 1.0)
 
             # Use calculator.audit_trip for expected, paid, and finding (no manual sum in tools)
-            summary = audit_trip(trip, ledger_lines, return_summary=True)
-            exp_fare = summary.expected_fare
-            paid_amount = summary.paid_amount
+            summary = audit_trip(trip, ledger_lines)
+            exp_fare = summary.expected
+            paid_amount = summary.paid
             finding = summary.finding
 
             # Window check relative to received_at (Rule 7)
@@ -293,9 +293,9 @@ def build_tools(ctx: RequestContext) -> List[Any]:
                         PayoutLine.rider_id == rider_id
                     ).all()
 
-                    f = audit_trip(trip, t_lines)
-                    if f:
-                        findings.append(f)
+                    audit_res = audit_trip(trip, t_lines)
+                    if audit_res.finding:
+                        findings.append(audit_res.finding)
 
             # Dedup findings by key
             unique_findings = list({f.key: f for f in findings}.values())

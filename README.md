@@ -1,78 +1,72 @@
 # DisputeAgent
 
-Autonomous AI support desk for delivery riders. Investigates payout disputes, verifies trip records and policies, and moves money via PaySwift or queues for human Ops review.
+Autonomous payout dispute resolution system for delivery riders. Investigates payout disputes, audits ledger records against platform policy, and settles owed amounts via automated payment or human Operations review.
 
 ---
 
-## How to Run
+## Architecture & Model Fallback Chain
 
-### 1. Prerequisites
-- Docker & Docker Compose
-- Groq API Key
+The agent orchestrates conversation turns using a request-scoped LangGraph ReAct agent loop.
 
-### 2. Setup & Start
-```bash
-# 1. Clone repository
-git clone <repo-url>
-cd <repo-folder>
-
-# 2. Configure environment
-cp .env.example .env
-# Edit .env and enter your GROQ_API_KEY
-
-# 3. Launch full system (Service + Postgres + PaySwift)
-docker compose up --build
-```
-- **Service API**: `http://localhost:8000` (`GET /health` returns `{"status":"ok"}`)
-- **Ops Dashboard**: `http://localhost:8000/ui`
-- **PaySwift Sandbox**: `http://localhost:8081`
-
-### 3. Run Evaluations
-```bash
-python evals/run.py http://localhost:8000
-```
+The model is instantiated lazily from the `LLM_ORDER` environment variable (a comma-separated list of `provider:model_name`, e.g. `groq:openai/gpt-oss-120b,groq:openai/gpt-oss-20b,gemini:gemini-2.5-flash`):
+- Providers with missing API keys in the environment are automatically skipped at startup.
+- The remaining configured providers are chained sequentially using LangChain `.with_fallbacks(...)`.
+- If an active provider fails during a request, execution fails over to the next configured model in the chain.
+- If the agent execution fails after retries, the system gracefully escalates the issue to the Operations queue and sends a polite fallback reply so no rider is left unanswered.
 
 ---
 
-## Agent Design & Division of Responsibility
+## Division of Responsibilities: Who Decides What
 
-Built with a **LangGraph ReAct Agent** powered by Groq (`openai/gpt-oss-20b` with automated fallback to `openai/gpt-oss-120b`).
+The platform strictly separates natural language understanding from critical financial logic and money movement:
 
-### Tools
-1. `get_rider_details`: Verifies rider identity and city from PostgreSQL.
-2. `get_trip_details`: Dynamically checks trip distance, full fare (base + extra km * surge), actual paid amount, and discrepancy.
-3. `get_trips_by_date`: Audits completed trips for daily incentives (>= 12 trips), uncredited trips, and duplicate cancellation penalties.
-4. `check_payout_history`: Inspects historical payout lines to prevent duplicate claims.
-5. `initiate_payout`: Dispatches payouts via PaySwift or queues for Ops review.
-6. `escalate_to_ops`: Creates pending escalation tickets for ops executives.
-
-### What the Model Decides
-- **Intent Recognition & Tone**: Understands natural, multi-turn Hinglish WhatsApp messages (e.g., *"bhai kal ka payout kam aaya"*, *"10 wala bhi de do"*).
-- **Autonomous Tool Routing**: Determines which investigative tools to invoke based on rider context.
-- **Synthesized Explanations**: Drafts respectful, concise breakdowns with exact Order IDs and rupee amounts.
-
-### What Deterministic Code Enforces
-- **Finance Limits**: Auto-pay capped at `<= ₹200` once per rider per day. Any amount `> ₹200` or repeat payout on the same day is strictly routed to `OpsDispute` for manual approval.
-- **7-Day Dispute Policy**: Hard policy gate (< 2026-09-16 strictly ineligible).
-- **Vendor Idempotency**: Deduplicates incoming WhatsApp messages using `message_id`; returns cached replies on retries.
-- **PaySwift Idempotency**: Issues unique idempotency keys per payout transaction to eliminate double-charges.
+| Responsibility | Handled By | Implementation / Guarantees |
+| :--- | :--- | :--- |
+| **Language Understanding & Dialogue** | LLM | Interprets conversational intent in Hinglish, Hindi, or English; asks for dates when missing; synthesizes polite responses (max 4 sentences). |
+| **Tool Routing & Query Formulation** | LLM | Selects appropriate investigative tools (`audit_day`, `inspect_trip`, `check_payout_history`, `settle_owed`, `escalate_to_ops`). |
+| **Fare & Incentive Calculation** | Code (`calculator.py`) | Deterministic base fare, per-km rates, surge multiplication with round-half-up, incentive thresholds (>=12 trips), and duplicate penalty detection. |
+| **Money Movement & Payout Amounts** | Code (`settlement.py`) | Recomputes exact discrepancies server-side from verified audit findings. Tools take NO caller-supplied amount parameter. |
+| **Financial Safeguards** | Code (`settlement.py`) | Auto-pay limit strictly <= ₹200; maximum 1 auto-pay per rider per IST calendar day; higher amounts or repeat payouts are automatically queued for Ops review. |
+| **Account Ownership & Isolation** | Code (`tools.py`) | Every tool is bound to a verified `RequestContext`. Riders can only access and settle their own trips. |
+| **Dispute Window Eligibility** | Code (`calculator.py`) | Enforces the 7-calendar-day window dynamically based on `received_at`. Expired trips cannot be paid. |
+| **Idempotency & Deduplication** | Code (`main.py`, `settlement.py`) | Incoming messages claimed with unique database locks; deterministic SHA1 idempotency keys for PaySwift transactions. |
 
 ---
 
-## Assumptions Made
-- All dispute dates belong to September 2026.
-- Relative date terms (e.g., *"kal"* / *"yesterday"*) resolve relative to the incoming message timestamp (e.g., 22 Sep -> 21 Sep).
-- Daily incentive (₹150) strictly requires >= 12 completed trips; rider cancellations incur standard ₹10 penalty.
+## Data Quality Rules & Sanitization
+
+1. **Distance Metric Normalization (Metres vs Kilometres)**:
+   - Raw distance values greater than 100 in the trip database represent metres (e.g. `5000` is 5,000 metres).
+   - Normalization converts these values to kilometres (`5.0 km`) dynamically at calculation time, preserving raw records in the database.
+
+2. **Rider ID Normalization**:
+   - Ingestion sanitizes varied user inputs (`R7`, `r19`, ` R019 `) into canonical padded strings (`R007`, `R019`).
+   - The rider ID is validated against the database before any request context or LLM execution begins. Invalid or unknown IDs trigger an Ops ticket and a polite fixed reply without invoking the LLM.
+
+3. **IST Calendar Date Alignment**:
+   - Timestamps are normalized to Indian Standard Time (`IST`, `UTC+05:30`).
+   - Trips, daily incentives, and payouts are evaluated by IST calendar dates, preventing timezone boundary shifts between UTC midnight and IST morning (05:30 AM).
+
+4. **Half-Up Rounding**:
+   - All financial amounts use symmetric arithmetic half-up rounding (`floor(x + 0.5)`), avoiding standard Python banker's rounding biases.
 
 ---
 
-## Evaluation Results
-- **Pass Rate**: **24/24 Passed (100%)**
-- **Evaluation Command**: `python evals/run.py http://localhost:8000`
+## Core Operational Assumptions
+
+- **7-Day Dispute Window**:
+  - The dispute window spans 7 calendar days inclusive of the message day (`[today - 6 days, today]`). For example, a dispute received on 2026-09-22 is eligible back to 2026-09-16; 2026-09-15 is expired.
+- **Single Legitimate Penalty**:
+  - A rider cancellation carries a standard ₹10 penalty. Refunds only apply when multiple penalty ledger lines exist for the same trip ID.
+- **Platform Policy Precedence**:
+  - The platform does not claw back overpayments.
+  - Vague complaints require clarifying dates or order numbers prior to running audits.
 
 ---
 
-## What Was Skipped
-- **Voice/Audio Notes**: Only WhatsApp text messages are ingested.
-- **OTP Verification**: Sender authentication relies on WhatsApp phone number metadata (`rider_id`).
-- **Live SMS Gateway**: Relies on PaySwift sandbox and simulated WhatsApp webhooks per assignment spec.
+## Evaluation Status
+
+- **Unit & System Integration Tests**:
+  - All deterministic business logic, settlement workflows, concurrent race guards, and agent loop behaviors are validated with comprehensive pytest suites using an in-memory hermetic SQLite database and simulated payment gateway.
+- **Held-Out Conversations**:
+  - LLM-level evaluation on held-out multi-turn conversation datasets is currently pending.

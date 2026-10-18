@@ -22,6 +22,7 @@ from app.agent.calculator import (
     audit_day,
     Finding,
     DayAudit,
+    TripAudit,
 )
 
 
@@ -300,7 +301,11 @@ def _line(trip_id, amount, category="trip"):
 class TestAuditTrip:
     def test_completed_unpaid_returns_finding(self):
         trip = _trip("T001", "completed", 3.0, 1.5)
-        finding = audit_trip(trip, [])
+        res = audit_trip(trip, [])
+        assert isinstance(res, TripAudit)
+        assert res.expected == 47
+        assert res.paid == 0
+        finding = res.finding
         assert finding is not None
         assert finding.kind == "unpaid"
         assert finding.amount == 47   # (25+1*6)*1.5 = 46.5 -> 47
@@ -309,13 +314,19 @@ class TestAuditTrip:
     def test_completed_fully_paid_no_finding(self):
         trip = _trip("T001", "completed", 3.0, 1.5)
         lines = [_line("T001", 47.0)]
-        assert audit_trip(trip, lines) is None
+        res = audit_trip(trip, lines)
+        assert res.expected == 47
+        assert res.paid == 47
+        assert res.finding is None
 
     def test_completed_underpaid_surge_missing(self):
         # Paid without surge (46), expected 47
         trip = _trip("T001", "completed", 3.0, 1.5)
         lines = [_line("T001", 31.0)]   # paid base only, forgot surge
-        finding = audit_trip(trip, lines)
+        res = audit_trip(trip, lines)
+        assert res.expected == 47
+        assert res.paid == 31
+        finding = res.finding
         assert finding is not None
         assert finding.kind == "underpaid"
         assert finding.amount == 16    # 47 - 31
@@ -324,12 +335,16 @@ class TestAuditTrip:
         """Platform never claws back overpayment."""
         trip = _trip("T001", "completed", 3.0, 1.0)
         lines = [_line("T001", 999.0)]
-        assert audit_trip(trip, lines) is None
+        res = audit_trip(trip, lines)
+        assert res.expected == 31
+        assert res.paid == 999
+        assert res.finding is None
 
     def test_cancelled_single_penalty_no_finding(self):
         trip = _trip("T002", "cancelled_by_rider", 5.0)
         lines = [_line("T002", -10.0, "cancellation_penalty")]
-        assert audit_trip(trip, lines) is None
+        res = audit_trip(trip, lines)
+        assert res.finding is None
 
     def test_cancelled_duplicate_penalty_finding(self):
         trip = _trip("T002", "cancelled_by_rider", 5.0)
@@ -337,7 +352,8 @@ class TestAuditTrip:
             _line("T002", -10.0, "cancellation_penalty"),
             _line("T002", -10.0, "cancellation_penalty"),
         ]
-        finding = audit_trip(trip, lines)
+        res = audit_trip(trip, lines)
+        finding = res.finding
         assert finding is not None
         assert finding.kind == "duplicate_penalty"
         assert finding.amount == 10
@@ -345,12 +361,16 @@ class TestAuditTrip:
 
     def test_non_completed_non_cancelled_no_finding(self):
         trip = _trip("T003", "cancelled_by_driver", 5.0)
-        assert audit_trip(trip, []) is None
+        res = audit_trip(trip, [])
+        assert res.finding is None
 
     def test_metres_distance_auto_converted(self):
         """distance_km = 5000 (metres) -> 5.0 km; fare at 1x = 25 + (5-2)*6 = 43."""
         trip = _trip("T004", "completed", 5000.0, 1.0)  # stored as metres
-        finding = audit_trip(trip, [])
+        res = audit_trip(trip, [])
+        assert res.expected == 43
+        assert res.paid == 0
+        finding = res.finding
         assert finding is not None
         # 5000 metres -> 5.0 km -> 25 + max(0, 5-2)*6 = 25 + 18 = 43
         assert finding.amount == 43
@@ -360,7 +380,10 @@ class TestAuditTrip:
         trip = SimpleNamespace(
             trip_id="T004", status="completed", distance_km_raw=5000.0, surge_multiplier=1.0
         )
-        finding = audit_trip(trip, [])
+        res = audit_trip(trip, [])
+        assert res.expected == 43
+        assert res.paid == 0
+        finding = res.finding
         assert finding is not None
         assert finding.kind == "unpaid"
         # 5000 raw -> converted to 5.0 km -> (25 + (5 - 2) * 6) * 1.0 = 43

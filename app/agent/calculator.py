@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -287,23 +288,33 @@ class Finding:
         return f"Finding({self.key!r}, Rs{self.amount}, {self.kind!r})"
 
 
-class TripAuditSummary:
-    """Detailed summary of a trip audit including expected fare and paid amount."""
-    __slots__ = ("expected_fare", "paid_amount", "finding")
+@dataclass
+class TripAudit:
+    """Consistent result of auditing a single trip."""
+    expected: int
+    paid: int
+    finding: Optional[Finding]
 
-    def __init__(self, expected_fare: int, paid_amount: int, finding: Optional[Finding]):
-        self.expected_fare = expected_fare
-        self.paid_amount = paid_amount
-        self.finding = finding
+    @property
+    def expected_fare(self) -> int:
+        return self.expected
+
+    @property
+    def paid_amount(self) -> int:
+        return self.paid
 
     def __iter__(self):
-        return iter((self.expected_fare, self.paid_amount, self.finding))
+        return iter((self.expected, self.paid, self.finding))
 
     def __repr__(self) -> str:
-        return f"TripAuditSummary(expected={self.expected_fare}, paid={self.paid_amount}, finding={self.finding!r})"
+        return f"TripAudit(expected={self.expected}, paid={self.paid}, finding={self.finding!r})"
 
 
-def audit_trip(trip: object, ledger_lines: list, return_summary: bool = False) -> Any:
+# Alias for backward compatibility
+TripAuditSummary = TripAudit
+
+
+def audit_trip(trip: object, ledger_lines: list) -> TripAudit:
     """Check a single trip for discrepancies against ledger payout lines.
 
     Args:
@@ -316,11 +327,9 @@ def audit_trip(trip: object, ledger_lines: list, return_summary: bool = False) -
             .trip_id  (str | None)
             .amount   (float)
             .category (str)
-        return_summary: if True, returns TripAuditSummary(expected_fare, paid_amount, finding).
-                        if False (default), returns finding or None.
 
     Returns:
-        A Finding if a discrepancy exists, None otherwise (or TripAuditSummary if return_summary=True).
+        TripAudit dataclass with (expected, paid, finding).
 
     Notes:
         - Overpayments are NOT findings (platform never claws back).
@@ -352,15 +361,11 @@ def audit_trip(trip: object, ledger_lines: list, return_summary: bool = False) -
                     f"lines found (expected 1). Extra Rs{amount_owed} deducted in error."
                 ),
             )
-        if return_summary:
-            return TripAuditSummary(expected_fare=0, paid_amount=0, finding=finding)
-        return finding
+        return TripAudit(expected=0, paid=0, finding=finding)
 
     if trip.status != "completed":
         # Other non-completed statuses earn Rs0 -- no finding
-        if return_summary:
-            return TripAuditSummary(expected_fare=0, paid_amount=0, finding=None)
-        return None
+        return TripAudit(expected=0, paid=0, finding=None)
 
     # Normalise distance (handle metres-stored-as-km, raw unconverted value)
     raw_dist = float(getattr(trip, "distance_km_raw", getattr(trip, "distance_km", 0.0)))
@@ -401,10 +406,7 @@ def audit_trip(trip: object, ledger_lines: list, return_summary: bool = False) -
             ),
         )
 
-    if return_summary:
-        return TripAuditSummary(expected_fare=earned, paid_amount=paid, finding=finding)
-
-    return finding
+    return TripAudit(expected=earned, paid=paid, finding=finding)
 
 
 # ---------------------------------------------------------------------------
@@ -473,9 +475,9 @@ def audit_day(ist_date: str, today: str, trips: list, ledger: list) -> DayAudit:
     findings: list = []
     for trip in trips:
         trip_lines = trip_ledger.get(trip.trip_id, [])
-        finding = audit_trip(trip, trip_lines)
-        if finding:
-            findings.append(finding)
+        audit_res = audit_trip(trip, trip_lines)
+        if audit_res.finding:
+            findings.append(audit_res.finding)
 
     # Incentive check
     incentive_eligible = completed_count >= INCENTIVE_TRIP_MIN

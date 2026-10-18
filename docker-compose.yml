@@ -37,17 +37,13 @@ services:
     volumes:
       - ./app:/app/app
       - ./ops-ui:/app/ops-ui
-    # environment:
-    #   - DATABASE_URL=postgresql://user:password@db:5432/dispute_agent
-    #   - PAYSWIFT_BASE_URL=http://payswift:8081
-    #   - GROQ_API_KEY=${GROQ_API_KEY}
-    #   - GROQ_MODEL=${GROQ_MODEL:-openai/gpt-oss-20b}
     environment:
       - DATABASE_URL=postgresql://user:password@db:5432/dispute_agent
       - PAYSWIFT_BASE_URL=http://payswift:8081
       - GROQ_API_KEY=${GROQ_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - LLM_ORDER=${LLM_ORDER:-groq:openai/gpt-oss-120b,groq:openai/gpt-oss-20b,gemini:gemini-2.5-flash}
+      - ALLOW_RESET=${ALLOW_RESET:-1}
 
 volumes:
   postgres_data:

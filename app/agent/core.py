@@ -1,80 +1,106 @@
-from dotenv import load_dotenv
-load_dotenv(override=True)
+"""core.py — DisputeAgent LangGraph ReAct orchestration.
+
+Dispatches all dispute resolution through a per-request compiled ReAct agent
+with request-scoped verified tools, dynamic prompts, and fallback chains.
+"""
+
+from __future__ import annotations
 
 import os
-import re
-import time
 import logging
+from functools import lru_cache
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Optional, List
 
-from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
-from app.agent.prompts import SYSTEM_PROMPT
-from app.agent.tools import (
-    get_rider_details,
-    get_trip_details,
-    get_trips_by_date,
-    check_payout_history,
-    initiate_payout,
-    escalate_to_ops
-)
+
+from app.agent.prompts import build_system_prompt
+from app.agent.tools import RequestContext, build_tools
+from app.agent.calculator import normalize_rider_id, DISPUTE_WINDOW_DAYS
 from app.agent.services import record_trace
 from app.db.session import SessionLocal
-from app.db.models import ConversationMessage
+from app.db.models import Rider, ConversationMessage, OpsDispute
 
 logger = logging.getLogger(__name__)
 
-# Fast, high-capacity models only
-def _build_model(provider: str, name: str):
-    if provider == "groq" and os.environ.get("GROQ_API_KEY"):
-        return ChatGroq(api_key=os.environ["GROQ_API_KEY"], model_name=name, temperature=0, max_retries=1)
-    if provider == "gemini" and os.environ.get("GOOGLE_API_KEY"):
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(model=name, google_api_key=os.environ["GOOGLE_API_KEY"], temperature=0, max_retries=1)
-    return None  # key missing, skip this model
 
-DEFAULT_ORDER = "groq:openai/gpt-oss-120b,groq:openai/gpt-oss-20b,gemini:gemini-2.5-flash"
-LLM_ORDER = os.environ.get("LLM_ORDER", DEFAULT_ORDER)
+def _flatten_content(content: Any) -> str:
+    """Flatten list-type or block message content (e.g. from Gemini or multi-part) to plain string."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item.strip())
+            elif isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item["text"]).strip())
+                elif "content" in item:
+                    parts.append(str(item["content"]).strip())
+                else:
+                    parts.append(str(item).strip())
+            elif hasattr(item, "text"):
+                parts.append(str(getattr(item, "text")).strip())
+            else:
+                parts.append(str(item).strip())
+        return " ".join(p for p in parts if p).strip()
+    return str(content).strip()
 
-_models = []
-for item in LLM_ORDER.split(","):
-    provider, name = item.strip().split(":", 1)
-    m = _build_model(provider.lower(), name)
-    if m is not None:
-        _models.append(m)
-        logger.info(f"LLM chain: {provider}:{name}")
 
-if not _models:
-    raise RuntimeError("No LLM configured: set GROQ_API_KEY and/or GOOGLE_API_KEY")
+@lru_cache(maxsize=1)
+def get_llm():
+    """Lazily instantiate the LLM chain from env LLM_ORDER with fallbacks.
 
-llm = _models[0].with_fallbacks(_models[1:]) if len(_models) > 1 else _models[0]
+    Skips any model whose provider API key is missing.
+    Raises RuntimeError if no models can be configured.
+    """
+    default_order = "groq:openai/gpt-oss-120b,groq:openai/gpt-oss-20b,gemini:gemini-2.5-flash"
+    llm_order = os.environ.get("LLM_ORDER", default_order)
+    models = []
 
-# Full tool suite for the autonomous dispute agent
-tools = [
-    get_rider_details,
-    get_trip_details,
-    get_trips_by_date,
-    check_payout_history,
-    initiate_payout,
-    escalate_to_ops
-]
+    for item in llm_order.split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        provider, name = item.split(":", 1)
+        provider = provider.strip().lower()
+        name = name.strip()
 
-# Create the LangGraph ReAct Agent
-agent_executor = create_react_agent(
-    model=llm,
-    tools=tools
-)
+        if provider == "groq" and os.environ.get("GROQ_API_KEY"):
+            try:
+                from langchain_groq import ChatGroq
+                models.append(ChatGroq(api_key=os.environ["GROQ_API_KEY"], model_name=name, temperature=0, max_retries=1))
+                logger.info(f"Initialized Groq LLM: {name}")
+            except Exception as e:
+                logger.warning(f"Could not load Groq model {name}: {e}")
+        elif provider == "gemini" and os.environ.get("GOOGLE_API_KEY"):
+            try:
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                models.append(ChatGoogleGenerativeAI(model=name, google_api_key=os.environ["GOOGLE_API_KEY"], temperature=0, max_retries=1))
+                logger.info(f"Initialized Gemini LLM: {name}")
+            except Exception as e:
+                logger.warning(f"Could not load Gemini model {name}: {e}")
 
-def get_recent_history(rider_id: str, limit: int = 4) -> list:
-    """Fetches recent conversation turns from the database for multi-turn context without duplication."""
+    if not models:
+        raise RuntimeError("No LLM configured: set GROQ_API_KEY and/or GOOGLE_API_KEY for providers in LLM_ORDER.")
+
+    return models[0].with_fallbacks(models[1:]) if len(models) > 1 else models[0]
+
+
+def get_recent_history(rider_id: str, current_message_id: str = "", limit: int = 4) -> list:
+    """Fetches recent conversation turns from the database, excluding current message_id."""
     db = SessionLocal()
     history = []
     try:
-        msgs = db.query(ConversationMessage).filter(
+        query = db.query(ConversationMessage).filter(
             ConversationMessage.rider_id == rider_id,
             ConversationMessage.sender == "rider"
-        ).order_by(ConversationMessage.id.desc()).limit(limit).all()
-        
-        # Order chronologically
+        )
+        if current_message_id:
+            query = query.filter(ConversationMessage.message_id != current_message_id)
+        msgs = query.order_by(ConversationMessage.id.desc()).limit(limit).all()
+
         msgs.reverse()
         for m in msgs:
             history.append(("human", m.text))
@@ -86,204 +112,132 @@ def get_recent_history(rider_id: str, limit: int = 4) -> list:
         db.close()
     return history
 
-def dispatch_expert_response(rider_id: str, message: str, past_turns: list) -> str:
+
+def process_dispute_message(
+    rider_id: str,
+    message: str,
+    message_id: str = "",
+    received_at: str = "",
+    llm: Any = None,
+) -> str:
+    """Primary handler: processes a dispute message through the LangGraph ReAct agent.
+
+    Validates rider_id first; constructs RequestContext, builds request-scoped tools
+    and system prompt, invokes agent with recursion_limit=14, retries on failure,
+    and escalates to Ops if the agent fails twice.
     """
-    Evaluates known operational workflows, policies, and multi-turn dispute patterns
-    with zero latency and deterministic accuracy, calling actual audit tools directly.
-    Returns None if the query should be routed to the ReAct agent.
-    """
-    lower_msg = message.lower().strip()
-    
-    # 1. Security / Prompt Injection Defense
-    if "system:" in lower_msg or "ignore all previous rules" in lower_msg or "ignore rules" in lower_msg:
-        return "Main platform policy ke tehat hi kaam kar sakta hoon. Aisi request accept nahi ki ja sakti."
-    
-    # 2. Impersonation Defense
-    m_imp = re.search(r"\bthis\s+is\s+(r\d{3})\b", lower_msg)
-    if m_imp:
-        claimed_id = m_imp.group(1).upper()
-        if claimed_id != rider_id.upper():
-            return f"Aapka registered rider ID {rider_id} hai. Hum kisi doosre rider ({claimed_id}) ke behalf par dispute process nahi kar sakte."
+    # 1. Validate rider ID BEFORE constructing RequestContext
+    clean_rider_id = None
+    try:
+        clean_rider_id = normalize_rider_id(rider_id)
+    except Exception:
+        clean_rider_id = None
 
-    # 3. Multi-turn Follow-up Reassurances & Pushbacks
-    # Pushback on Ops approval: "10 wala bhi abhi de do na"
-    if ("10 wala" in lower_msg or "abhi de do" in lower_msg) and any("15" in t[1] for t in past_turns if len(t) > 1 and t[1]):
-        return "₹15 abhi bhej rahe hain; ek din mein ek hi auto-payment ho sakta hai, isliye ₹10 ops team approve karegi."
-    
-    # Follow-up status check: "thik hai, kab tak aayega?"
-    if "kab tak aayega" in lower_msg or "kab aayega" in lower_msg or "thik hai" in lower_msg:
-        if any("25" in t[1] or "payswift" in t[1].lower() for t in past_turns if len(t) > 1 and t[1]):
-            return "₹25 ka payment PaySwift pe process ho gaya hai. Aapke account mein jald credit ho jayega."
+    rider_found = False
+    if clean_rider_id:
+        db = SessionLocal()
+        try:
+            r = db.query(Rider).filter(Rider.rider_id == clean_rider_id).first()
+            if r:
+                rider_found = True
+        finally:
+            db.close()
 
-    # Pushback on incentive rejection: "nahi nahi 12 kiye the, dobara check karo"
-    if ("dobara check" in lower_msg or "12 kiye" in lower_msg or "recheck" in lower_msg or "nahi nahi" in lower_msg) and any("10" in t[1] or "incentive" in t[1].lower() for t in past_turns if len(t) > 1 and t[1]):
-        return "Bhai re-check kiya, 19 Sep ko sirf 10 trips complete hui thi. Policy ke mutabik 12 trips par hi ₹150 incentive milta hai."
+    if not clean_rider_id or not rider_found:
+        # Invalid format or unknown rider: polite fixed reply + ops escalation + NO LLM call
+        fallback_rider_id = clean_rider_id or str(rider_id)
+        db = SessionLocal()
+        try:
+            count = db.query(OpsDispute).count() + 1
+            op_id = f"op-{count:03d}"
+            now_iso = datetime.now(timezone.utc).isoformat()
+            escalation = OpsDispute(
+                dispute_id=op_id,
+                rider_id=fallback_rider_id,
+                trip_id=None,
+                type="escalation",
+                amount=None,
+                reason=f"Invalid or unknown rider ID: {rider_id}",
+                status="PENDING",
+                created_at=now_iso,
+            )
+            db.add(escalation)
+            db.commit()
+        except Exception as e:
+            logger.error(f"Error logging ops escalation for bad rider {rider_id}: {e}")
+        finally:
+            db.close()
 
-    # 4. Multi-issue single message (Scenario 2: R027)
-    if "surge nahi mila" in lower_msg and "penalty" in lower_msg and "20" in lower_msg and "21" in lower_msg:
-        get_trips_by_date.invoke({"rider_id": rider_id, "date_query": "2026-09-20"})
-        initiate_payout.invoke({"rider_id": rider_id, "amount": 15, "reason": "missing surge on T604546 for 20 Sep"})
-        get_trips_by_date.invoke({"rider_id": rider_id, "date_query": "2026-09-21"})
-        initiate_payout.invoke({"rider_id": rider_id, "amount": 10, "reason": "refund duplicate cancellation penalty for 21 Sep"})
-        return "Dono check kiye. 20 Sep: order T604546 pe surge nahi laga, ₹15 kam aaye. 21 Sep: cancel penalty do baar kata, ₹10 extra kata. ₹15 abhi bhej rahe hain; ek din mein ek hi auto-payment ho sakta hai, isliye ₹10 ops team approve karegi."
+        record_trace(fallback_rider_id, "decision", "invalid_rider", {"raw_id": rider_id}, "Escalated to Ops")
+        return "Aapka rider account verify nahi ho paya. Humne yeh case manual review ke liye Operations team ko forward kar diya hai."
 
-    # 5. Multiple missing orders by date
-    # Scenario 10 (R016): 5 orders missing on 19 Sep
-    if "5 order" in lower_msg and ("19" in lower_msg or "sept" in lower_msg):
-        get_trips_by_date.invoke({"rider_id": rider_id, "date_query": "2026-09-19"})
-        initiate_payout.invoke({"rider_id": rider_id, "amount": 425, "reason": "5 unpaid orders on 19 Sep totaling ₹425"})
-        return "19 Sep ke 5 orders ka paisa payout mein shamil nahi tha. Kul ₹425 ka claim ₹200 limit se zyada hone ke karan Ops review ke liye approve list mein submit kar diya hai."
+    # 2. Construct verified RequestContext and tools
+    ctx = RequestContext(clean_rider_id, received_at=received_at, message_id=message_id)
+    tools = build_tools(ctx)
 
-    # Scenario 19 (R033): 2 orders missing on 20 Sep (T795007, T206956)
-    if "2 order" in lower_msg and ("20" in lower_msg or "t795007" in lower_msg or "t206956" in lower_msg):
-        get_trips_by_date.invoke({"rider_id": rider_id, "date_query": "2026-09-20"})
-        initiate_payout.invoke({"rider_id": rider_id, "amount": 176, "reason": "2 unpaid orders T795007, T206956 on 20 Sep totaling ₹176"})
-        return "20 Sep ke 2 orders (T795007, T206956) ka payment missing tha. Total ₹176 PaySwift ke zariye aapke account mein transfer kar diya gaya hai."
+    # 3. Dynamic system prompt based on rider and IST dispute window
+    today_d = date.fromisoformat(ctx.today_ist)
+    window_start_d = today_d - timedelta(days=DISPUTE_WINDOW_DAYS - 1)
+    prompt = build_system_prompt(clean_rider_id, ctx.today_ist, window_start_d.isoformat())
 
-    # Scenario 20 (R034): 3 orders missing on 19 Sep
-    if "3 order" in lower_msg and ("19" in lower_msg or "sep" in lower_msg):
-        get_trips_by_date.invoke({"rider_id": rider_id, "date_query": "2026-09-19"})
-        initiate_payout.invoke({"rider_id": rider_id, "amount": 249, "reason": "3 unpaid orders on 19 Sep totaling ₹249"})
-        return "19 Sep ke 3 orders ka pending payment total ₹249 banta hai. Amount ₹200 se zyada hone ke karan ye Ops approval ke liye pending list mein submit kar diya gaya hai."
+    # 4. Resolve active LLM (parameter takes precedence for tests)
+    active_llm = llm if llm is not None else get_llm()
 
-    # 6. Daily incentive disputes
-    if "incentive" in lower_msg or "12 order" in lower_msg or "12 se zyada" in lower_msg:
-        target_date = "2026-09-21" if ("kal" in lower_msg or "yesterday" in lower_msg) else None
-        if not target_date:
-            for day in ["17", "18", "19", "20", "21", "22"]:
-                if day in lower_msg:
-                    target_date = f"2026-09-{day}"
-                    break
-        if not target_date:
-            target_date = "2026-09-21"
-        
-        trip_summary = get_trips_by_date.invoke({"rider_id": rider_id, "date_query": target_date})
-        m_comp = re.search(r"Completed Trips Count:\s*(\d+)", trip_summary)
-        comp_count = int(m_comp.group(1)) if m_comp else 0
-        
-        if comp_count >= 12:
-            initiate_payout.invoke({"rider_id": rider_id, "amount": 150, "reason": f"Daily incentive for {target_date}"})
-            return f"{target_date} ko aapne {comp_count} orders complete kiye the. ₹150 daily incentive aapke account mein transfer kar diya gaya hai."
-        else:
-            return f"{target_date} ko aapke record mein sirf {comp_count} completed orders hain. Daily incentive ke liye kam se kam 12 completed trips hone zaroori hain, isliye incentive eligible nahi hai."
-
-    # 7. Cancellation penalty disputes (duplicate deduction refund)
-    if ("penalty" in lower_msg and ("2 baar" in lower_msg or "do baar" in lower_msg or "double" in lower_msg)) or ("cancel" in lower_msg and "2 baar" in lower_msg):
-        target_date = "2026-09-18" if "18" in lower_msg else ("2026-09-21" if "21" in lower_msg else "2026-09-18")
-        get_trips_by_date.invoke({"rider_id": rider_id, "date_query": target_date})
-        initiate_payout.invoke({"rider_id": rider_id, "amount": 10, "reason": f"refund duplicate cancellation penalty for {target_date}"})
-        return f"{target_date} ko ek hi cancellation par penalty galti se 2 baar kat gayi thi. Excess ₹10 refund aapke account mein bhej diya gaya hai."
-
-    # 8. Specific Trip ID mentioned (T\d{6})
-    m_trip = re.search(r"\b(T\d{6})\b", message, re.IGNORECASE)
-    if m_trip:
-        t_id = m_trip.group(1).upper()
-        trip_info = get_trip_details.invoke({"trip_id": t_id})
-        
-        # 7-day window check
-        if "EXPIRED" in trip_info or "13 sept" in lower_msg or "13 sep" in lower_msg:
-            return f"Order {t_id} 13 Sep ka hai jo 7 din se purana hai. platform policy ke tehat 7 din se purane trips par dispute allow nahi hota."
-        
-        # Accident / Cancellation penalty policy
-        if "accident" in lower_msg or ("cancel" in lower_msg and "penalty" in lower_msg):
-            return f"Hum samajhte hain aapka accident hua tha, lekin platform policy ke tehat rider cancellation par standard ₹10 penalty non-refundable hoti hai."
-        
-        # Distance dispute
-        if "distance" in lower_msg:
-            escalate_to_ops.invoke({"rider_id": rider_id, "reason": f"Distance dispute on trip {t_id}"})
-            return f"Order {t_id} ke distance dispute ko Ops team ko review ke liye escalate kar diya gaya hai."
-        
-        # Check discrepancy
-        m_disc = re.search(r"UNDERPAID\s+by\s+₹?(\d+)", trip_info)
-        if m_disc:
-            gap = int(m_disc.group(1))
-            initiate_payout.invoke({"rider_id": rider_id, "amount": gap, "reason": f"underpaid fare or missing surge for trip {t_id}"})
-            return f"Trip {t_id} check kiya. Isme ₹{gap} missing tha, jo PaySwift se aapko bhej diya gaya hai."
-        else:
-            return f"Order {t_id} ka record check kiya. Iska pura payout calculation ke mutabik bilkul sahi laga hai aur koi discrepancy nahi hai."
-
-    # 9. Scenario 1 Turn 2: "20 wala"
-    if lower_msg in ["20 wala", "20", "20 tareekh", "20 tarikh", "20 sep", "20 sept", "20th"] or ("20" in lower_msg and len(lower_msg) < 15):
-        get_trips_by_date.invoke({"rider_id": rider_id, "date_query": "2026-09-20"})
-        initiate_payout.invoke({"rider_id": rider_id, "amount": 25, "reason": "missing surge on T926334 for 20 Sep"})
-        return "20 Sep ko order T926334 pe 1.5x surge laga tha: ₹74 banta tha, ₹49 mila. Farak ₹25 aapko bhej rahe hain."
-
-    # 10. Vague complaints with no specific date or trip ID
-    if any(phrase in lower_msg for phrase in ["payout galat", "payout kam", "galat aaya", "kam aaya"]):
-        if not re.search(r"\b(1[2-9]|2[0-2])\b", lower_msg) and not re.search(r"\bT\d{6}\b", lower_msg, re.IGNORECASE) and "kal" not in lower_msg:
-            return "Kaunse din ya kaunse order ka payout galat laga? Date ya order ID bata dijiye."
-
-    return None
-
-def process_dispute_message(rider_id: str, message: str, message_id: str = None, received_at: str = None) -> str:
-    """
-    Takes a rider's message, incorporates multi-turn memory, evaluates against
-    expert dispute resolution logic with immediate execution, or runs through
-    the LangGraph ReAct agent as fallback, recording audit trace steps.
-    """
-    # 1. Record incoming message in trace audit log
-    record_trace(
-        rider_id=rider_id,
-        step_type="message_in",
-        name="incoming_message",
-        input_data={"message_id": message_id, "text": message, "received_at": received_at},
-        output_data=None
+    # 5. Compile request-scoped LangGraph ReAct agent
+    agent_executor = create_react_agent(
+        model=active_llm,
+        tools=tools,
+        prompt=prompt
     )
 
-    # 2. Retrieve past conversation history
-    past_turns = get_recent_history(rider_id)
+    # 6. Build messages with multi-turn history excluding current message_id
+    history = get_recent_history(clean_rider_id, current_message_id=message_id, limit=4)
+    messages: List[Any] = []
+    for role, text in history:
+        messages.append((role, text))
+    messages.append(("human", message))
 
-    # 3. Fast-path deterministic expert resolution
-    try:
-        expert_reply = dispatch_expert_response(rider_id, message, past_turns)
-        if expert_reply:
-            record_trace(
-                rider_id=rider_id,
-                step_type="reply",
-                name="agent_reply",
-                input_data=None,
-                output_data=expert_reply
-            )
-            return expert_reply
-    except Exception as e:
-        logger.warning(f"Expert dispatcher encountered exception, falling back to ReAct agent: {e}", exc_info=True)
+    record_trace(clean_rider_id, "message_in", "user_message", {"message_id": message_id}, message)
 
-    # 4. Build conversational message sequence for ReAct Agent
-    messages = [("system", SYSTEM_PROMPT)]
-    messages.extend(past_turns)
-    messages.append(("human", f"[Rider ID: {rider_id}] {message}"))
-    
-    inputs = {"messages": messages}
-
-    reply_content = None
+    # 7. Execute agent loop (with recursion_limit=14, up to 2 attempts)
+    last_err = None
     for attempt in range(2):
         try:
-            result = agent_executor.invoke(inputs)
-            reply_content = result["messages"][-1].content
-            break
+            output = agent_executor.invoke({"messages": messages}, config={"recursion_limit": 14})
+            raw_reply = output["messages"][-1].content
+            reply = _flatten_content(raw_reply)
+            record_trace(clean_rider_id, "reply", "agent_reply", {"attempt": attempt + 1}, reply)
+            return reply
         except Exception as e:
-            err_msg = str(e)
-            logger.error(f"Error during ReAct agent execution: {err_msg}")
-            if attempt < 1:
-                time.sleep(1)
-                continue
-            record_trace(
-                rider_id=rider_id,
-                step_type="error",
-                name="agent_execution_failure",
-                input_data={"message": message},
-                output_data=err_msg
-            )
-            reply_content = "Bhai, humare system mein thodi takneeki samasya aayi hai. Kripya thodi der baad dobara message karein."
-            break
+            last_err = e
+            logger.warning(f"Agent attempt {attempt + 1} failed for {clean_rider_id}: {e}", exc_info=True)
 
-    # 5. Record agent reply in trace log
-    record_trace(
-        rider_id=rider_id,
-        step_type="reply",
-        name="agent_reply",
-        input_data=None,
-        output_data=reply_content
+    # 8. Agent failed twice: create ops escalation and return polite fallback
+    db = SessionLocal()
+    try:
+        count = db.query(OpsDispute).count() + 1
+        op_id = f"op-{count:03d}"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        escalation = OpsDispute(
+            dispute_id=op_id,
+            rider_id=clean_rider_id,
+            trip_id=None,
+            type="escalation",
+            amount=None,
+            reason=f"Agent failed after 2 attempts: {str(last_err)}",
+            status="PENDING",
+            created_at=now_iso,
+        )
+        db.add(escalation)
+        db.commit()
+    except Exception as e:
+        logger.error(f"Error logging failed agent ops escalation: {e}")
+    finally:
+        db.close()
+
+    fallback_reply = (
+        "Aapka message receive ho gaya hai. System issue ki wajah se humne aapka case "
+        "manual review ke liye Operations team ko bhej diya hai. Jald hi aapko update milega."
     )
-
-    return reply_content
+    record_trace(clean_rider_id, "reply", "agent_fallback", {"error": str(last_err)}, fallback_reply)
+    return fallback_reply
